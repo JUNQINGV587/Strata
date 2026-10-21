@@ -141,6 +141,12 @@ struct Options {
     std::string verify_ids;     // --dsv4-verify-ids "a,b,c,..." (R tokens, the draft batch)
     int mrow_bench = 0;         // --dsv4-mrow-bench R
     std::string bench_ids;      // --dsv4-mrow-bench-ids "a,b,...": distinct per-row tokens (real routing)
+    // [chunk] long-prompt prefill: split the prompt into W-row passes inside ONE process, each pass
+    // continuing the KV / compressor / ring state the previous one left (start_pos = chunk offset:
+    // dsv4ref run_pass's decode contract, which R-01/R-06 made bit-exact for s > 1).  0 keeps the
+    // single-pass behaviour; W is capped at the sliding window (a pass wider than the ring has no
+    // defined ring shift, dsv4_attn.cu's start_pos == 0 check).
+    int64_t prefill_chunk = 0;  // --dsv4-prefill-chunk W
 };
 
 bool parse_args(int argc, char** argv, Options& o) {
@@ -167,6 +173,7 @@ bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--dsv4-verify-ids") o.verify_ids = next();
         else if (a == "--dsv4-mrow-bench") o.mrow_bench = std::atoi(next().c_str());
         else if (a == "--dsv4-mrow-bench-ids") o.bench_ids = next();
+        else if (a == "--dsv4-prefill-chunk") o.prefill_chunk = std::atoll(next().c_str());
         else if (a.rfind("--", 0) == 0) {
             // the family switch forwards strata's whole command line; an option this engine does not have is
             // said and skipped (with its value), not fatal (q36_engine.cu's serve-mode rule, always on in S0)
@@ -179,6 +186,7 @@ bool parse_args(int argc, char** argv, Options& o) {
                          "usage: strata-dsv4 --model GGUF [--pack DIR] [--max-context 32768]\n"
                          "       [--dsv4-forward] [--dsv4-dump-dir DIR] [--dsv4-replay DIR]\n"
                          "       [--dsv4-pass prefill] [--dsv4-prompt-ids \"0,128803,...\"] [--dsv4-decode N]\n"
+                         "       [--dsv4-prefill-chunk W]  (W-row prefill passes over one process, default 0\n"
                          "       (S1: loads the pack + GGUF, prints the geometry and expert-pool residency\n"
                          "       report; with --dsv4-forward (implied by --dsv4-dump-dir/--dsv4-replay) runs\n"
                          "       the GPU tail forward embed -> 43 identity layers -> hc_head -> output_norm\n"
@@ -1092,7 +1100,7 @@ bool forward_tail(const Options& o, Model& m, std::string& err) {
         if (cudaEventCreate(&ea1) != cudaSuccess) ea1 = nullptr;
     }
     auto run_pass = [&](const std::string& pass, int64_t start_pos, int64_t s_cur,
-                        const int32_t* batch_ids) -> int64_t {
+                        const int32_t* batch_ids, bool chunk, bool dump) -> int64_t {
         // [R-06] the workspaces and the per-pass device buffers are sized for s_ws rows: reject a pass
         // that is wider (clean error, not a device OOB write / abort)
         if (s_cur <= 0 || s_cur > s_ws) {
@@ -1129,7 +1137,8 @@ bool forward_tail(const Options& o, Model& m, std::string& err) {
             }
         }
         const auto pt0 = Clock::now();  // [S7d diag] pre-loop segment
-        const std::string dir = o.dump_dir.empty() ? std::string() : o.dump_dir + "/" + pass;
+        const std::string dir =
+            (o.dump_dir.empty() || !dump) ? std::string() : o.dump_dir + "/" + pass;
         if (!dir.empty()) std::filesystem::create_directories(dir);
         // ---- embed (iq_embed_rows: the Q8_0 table's rows gathered + dequantized on the GPU)
         const size_t row_bytes = (size_t) (w.embd->bytes / (uint64_t) w.embd->ne1);
@@ -1328,6 +1337,9 @@ bool forward_tail(const Options& o, Model& m, std::string& err) {
         if (start_pos > 0 && s_cur > 1) {
             // [G1] multi-row pass: every row's argmax (row r must predict what the single-row path
             // produced at start_pos + r, which is what the verify/dump comparison checks row by row).
+            // [chunk] a chunked prefill pass prints its rows too (chunk c's row r is prompt row
+            // start_pos + r, so the per-row argmax list of a chunk run can be laid against the single
+            // pass's 128-row list).
             for (int64_t r = 0; r < s_cur; ++r) {
                 const float* row = host.data() + (size_t) r * V;
                 int64_t b = 0;
@@ -1335,6 +1347,19 @@ bool forward_tail(const Options& o, Model& m, std::string& err) {
                     if (row[i] > row[b]) b = i;
                 std::fprintf(stderr, "strata-dsv4: %s row %lld argmax %lld\n", pass.c_str(),
                              (long long) r, (long long) b);
+            }
+        }
+        if (chunk && start_pos == 0 && s_cur > 1) {
+            // [chunk] the first chunk is the only prefill-mode pass; mirror the row list above so every
+            // chunk reports where its rows land (the gate lays chunk row r against single-pass row
+            // start_pos + r).
+            for (int64_t r = 0; r < s_cur; ++r) {
+                const float* row = host.data() + (size_t) r * V;
+                int64_t b = 0;
+                for (int64_t i = 1; i < V; ++i)
+                    if (row[i] > row[b]) b = i;
+                std::fprintf(stderr, "strata-dsv4: %s row %lld argmax %lld (pos %lld)\n", pass.c_str(),
+                             (long long) r, (long long) b, (long long) (start_pos + r));
             }
         }
         if (eton) {
@@ -1347,8 +1372,74 @@ bool forward_tail(const Options& o, Model& m, std::string& err) {
     // ---- the passes: prefill (under the --dsv4-pass name), then --dsv4-decode single-token steps feeding
     // the argmax back (dsv4ref main() :1461: start_pos is the sequence length BEFORE the append, so the
     // appended token is the pass's only row; golden generated ids are 734, 260, 4654)
-    int64_t cur = run_pass(o.pass_name, 0, s, ids32.data());
-    if (cur < 0) return false;
+    //
+    // [chunk] --dsv4-prefill-chunk W splits the prompt into W-row passes inside this process: pass i
+    // covers positions [i*W, min((i+1)*W, s)) with start_pos = i*W, so it continues the KV ring, the
+    // compressor carry states and the expert cache the previous pass left (no process restart, no
+    // re-load of the 1.6 GB pinned expert pool).  The LAST pass carries the --dsv4-pass name and its
+    // dumps, so a chunked run's dump tree is the single pass's tail rows (the gate compares them).
+    // The pass that starts at start_pos == 0 is a prefill-mode pass (bulk pooling); the continuations
+    // go through the decode contract (per-row ring writes, block-completion pooling).
+    int64_t chunk_w = o.prefill_chunk;
+    if (chunk_w > 0 && chunk_w > g.sliding_window) {
+        std::fprintf(stderr,
+                     "strata-dsv4: --dsv4-prefill-chunk %lld exceeds the sliding window %lld (a pass "
+                     "wider than the ring has no defined ring shift); using %lld\n",
+                     (long long) chunk_w, (long long) g.sliding_window, (long long) g.sliding_window);
+        chunk_w = g.sliding_window;
+    }
+    const int64_t n_chunks = chunk_w > 0 ? (s + chunk_w - 1) / chunk_w : 1;
+    int64_t cur = 0;
+    if (n_chunks <= 1) {
+        cur = run_pass(o.pass_name, 0, s, ids32.data(), false, true);
+        if (cur < 0) return false;
+    } else {
+        const auto pf0 = Clock::now();
+        int64_t ch0 = 0, cm0 = 0, ev0 = 0;
+        strata::dsv4::dsv4_moe_ws_cache_stats(moe_ws, ch0, cm0);
+        ev0 = strata::dsv4::dsv4_moe_ws_evictions(moe_ws);
+        std::fprintf(stderr,
+                     "strata-dsv4: chunked prefill: %lld tokens in %lld passes of %lld rows (sliding "
+                     "window %lld)\n",
+                     (long long) s, (long long) n_chunks, (long long) chunk_w,
+                     (long long) g.sliding_window);
+        for (int64_t ci = 0; ci < n_chunks; ++ci) {
+            const int64_t off = ci * chunk_w;
+            const int64_t sw = std::min<int64_t>(chunk_w, s - off);
+            const bool last = ci + 1 == n_chunks;
+            char pname[96];
+            // non-final passes get their own name and no dump (a chunk's dumps are not a gate artifact;
+            // the last pass is the one compared against the single-pass run)
+            std::snprintf(pname, sizeof pname, "%s_c%lld", o.pass_name.c_str(), (long long) (ci + 1));
+            int64_t ch1 = 0, cm1 = 0, ev1 = 0;
+            const auto ck0 = Clock::now();
+            cur = run_pass(last ? o.pass_name : std::string(pname), off, sw, ids32.data() + off, true,
+                           last);
+            if (cur < 0) return false;
+            const double cms = ms_since(ck0);
+            strata::dsv4::dsv4_moe_ws_cache_stats(moe_ws, ch1, cm1);
+            ev1 = strata::dsv4::dsv4_moe_ws_evictions(moe_ws);
+            const int64_t dh = ch1 - ch0, dm = cm1 - cm0, de = ev1 - ev0;
+            std::fprintf(stderr,
+                         "strata-dsv4: chunk %lld/%lld pos %lld..%lld (%lld rows) %.1f ms | experts "
+                         "hits +%lld misses +%lld evict +%lld (chunk hit %.1f%%, cumulative "
+                         "hits %lld misses %lld) | last-row argmax %lld\n",
+                         (long long) (ci + 1), (long long) n_chunks, (long long) off,
+                         (long long) (off + sw - 1), (long long) sw, cms, (long long) dh,
+                         (long long) dm, (long long) de,
+                         (dh + dm) > 0 ? 100.0 * (double) dh / (double) (dh + dm) : 0.0,
+                         (long long) ch1, (long long) cm1, (long long) cur);
+            ch0 = ch1;
+            cm0 = cm1;
+            ev0 = ev1;
+        }
+        const double pms = ms_since(pf0);
+        std::fprintf(stderr,
+                     "strata-dsv4: chunked prefill done: %lld tokens, %lld passes, %.1f ms total "
+                     "(%.2f t/s), TTFT %.1f ms\n",
+                     (long long) s, (long long) n_chunks, pms, pms > 0 ? 1000.0 * (double) s / pms : 0.0,
+                     pms);
+    }
     if (o.prompt_ids.empty())
         std::fprintf(stderr, "strata-dsv4: prefill argmax %lld vs golden 9544: %s\n", (long long) cur,
                      cur == 9544 ? "MATCH" : "MISMATCH");
@@ -1389,7 +1480,7 @@ bool forward_tail(const Options& o, Model& m, std::string& err) {
         CK(cudaMemcpy(d_tokens + start_pos, &cur32, sizeof(int32_t), cudaMemcpyHostToDevice));
         char pname[32];
         std::snprintf(pname, sizeof pname, "decode%d", step);
-        cur = run_pass(pname, start_pos, 1, &cur32);
+        cur = run_pass(pname, start_pos, 1, &cur32, false, true);
         if (cur < 0) return false;
         if (o.prompt_ids.empty() && step <= 3)
             std::fprintf(stderr, "strata-dsv4: %s argmax %lld vs golden %lld: %s\n", pname,
@@ -1421,7 +1512,7 @@ bool forward_tail(const Options& o, Model& m, std::string& err) {
         for (int r = 0; r < o.verify_rows; ++r) all.push_back(fids[(size_t) r]);
         char pname[32];
         std::snprintf(pname, sizeof pname, "mrow%d", o.verify_rows);
-        cur = run_pass(pname, start_pos, o.verify_rows, fids.data());
+        cur = run_pass(pname, start_pos, o.verify_rows, fids.data(), false, true);
         if (cur < 0) return false;
     }
     if (o.mrow_bench > 0) {
@@ -1454,7 +1545,7 @@ bool forward_tail(const Options& o, Model& m, std::string& err) {
             }
             char pname[32];
             std::snprintf(pname, sizeof pname, "mrowb%d", step);
-            cur = run_pass(pname, start_pos, R, batch_ids.data());
+            cur = run_pass(pname, start_pos, R, batch_ids.data(), false, true);
             if (cur < 0) return false;
         }
     }
