@@ -60,6 +60,8 @@ struct Dsv4MoeWs;
 
 Dsv4MoeWs* dsv4_moe_ws_new(const Dsv4Geometry& g, int64_t s, std::string& err);
 void dsv4_moe_ws_free(Dsv4MoeWs* ws);
+/// [diag] print the accumulated STRATA_DSV4_TIME MoE split (tag names the pass).
+void dsv4_moe_ws_report(Dsv4MoeWs* ws, const char* tag);
 /// [S7a-2] the layer count for the predictive-warm window's wrap (0: warm off).
 void dsv4_moe_ws_set_layers(Dsv4MoeWs* ws, int n_layers);
 /// [S7a-3] the VRAM expert tier: c0 on the compute device, c1 on the peer.  Either may be null.

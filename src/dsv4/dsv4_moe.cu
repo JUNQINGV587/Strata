@@ -696,6 +696,7 @@ struct Dsv4MoeWs {
     bool time_on = false;
     bool overlap_shared = false;       // [S7e] shared expert on a side stream (default on)
     double tm_pre = 0, tm_sync = 0, tm_group = 0, tm_chunks = 0, tm_tail = 0;
+    double tm_g1 = 0, tm_g2 = 0, tm_g3 = 0;  // [DIAG] group sub-phases
     int64_t moe_calls = 0;
     // [S7b] heat-driven admission: decayed per-(layer, expert) routing counts; a miss whose layer
     // quota is full swaps out the coldest resident when clearly hotter (STRATA_DSV4_EVICT_GAIN,
@@ -740,6 +741,7 @@ struct Dsv4MoeWs {
         int threads = 4;                  ///< reader threads per blob (STRATA_DSV4_COLDPIPE_THREADS)
     };
     ColdPipe cp;
+
 };
 
 // [S8] A/B switch for the pinned upload arenas (0 = the pre-S8 pageable staging path)
@@ -1058,6 +1060,7 @@ int64_t dsv4_moe_ws_evictions(const Dsv4MoeWs* ws) { return ws ? ws->evictions :
 void dsv4_moe_ws_reset_timing(Dsv4MoeWs* ws) {
     if (!ws) return;
     ws->tm_pre = ws->tm_sync = ws->tm_group = ws->tm_chunks = ws->tm_tail = 0;
+    ws->tm_g1 = ws->tm_g2 = ws->tm_g3 = 0;
     ws->tg_chunks = ws->tg_peer = ws->tg_shared = ws->tg_hcpost = ws->tg_route = 0;
     ws->tg_hcpre = ws->tg_rms = ws->tg_gate = ws->tg_topk = 0;
     ws->tm_cold_read = ws->tm_cold_fill = ws->tm_cold_staged = 0;
@@ -1077,6 +1080,30 @@ static void dsv4_cp_release(Dsv4MoeWs* ws) {
         if (q == cudaSuccess) { cp.state[i] = 0; cp.key[i] = -1; }
         else if (q != cudaErrorNotReady) { (void) cudaGetLastError(); cp.state[i] = 0; cp.key[i] = -1; }
     }
+}
+
+// [DIAG] timing-only ablation switches (never on in a normal run): STRATA_ABL_NOCOPY skips every expert
+// blob DMA, STRATA_ABL_NOGEMV skips the grouped GEMV/swiglu/scatter launches.  The output is garbage by
+// construction; the pass time then reads the share each side holds of the wall.
+static bool dsv4_ablit(const char* key) {
+    const char* v = std::getenv(key);
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+
+// [DIAG] one blob-sized pinned scratch for the read/DMA split ablations.
+static uint8_t* dsv4_abl_scratch(size_t bytes) {
+    static uint8_t* p = nullptr;
+    static size_t n = 0;
+    if (n < bytes) {
+        if (p != nullptr) (void) cudaFreeHost(p);
+        if (cudaHostAlloc((void**) &p, bytes, cudaHostAllocPortable) != cudaSuccess) {
+            (void) cudaGetLastError();
+            p = nullptr; n = 0;
+            return nullptr;
+        }
+        n = bytes;
+    }
+    return p;
 }
 
 static int dsv4_cp_acquire(Dsv4MoeWs* ws) {
@@ -1186,7 +1213,14 @@ static int32_t dsv4_admit_heat(Dsv4MoeWs* ws, strata::core::ExpertCache* C,
         failed = true;
         return strata::core::kNotResident;
     }
-    if (!C->fill_slot(slot, blob, stream, err, blob_bytes)) {
+    if (dsv4_ablit("STRATA_ABL_NOREAD")) blob = dsv4_abl_scratch((size_t) blob_bytes);
+    if (dsv4_ablit("STRATA_ABL_NODMA")) {
+        uint8_t* scratch = dsv4_abl_scratch((size_t) blob_bytes);
+        if (scratch != nullptr) std::memcpy(scratch, blob, (size_t) blob_bytes);
+        return slot;
+    }
+    if (!dsv4_ablit("STRATA_ABL_NOCOPY") &&
+        !C->fill_slot(slot, blob, stream, err, blob_bytes)) {
         failed = true;
         return strata::core::kNotResident;
     }
@@ -1198,6 +1232,39 @@ static int32_t dsv4_admit_heat(Dsv4MoeWs* ws, strata::core::ExpertCache* C,
     }
     experts.note_async_read(blob, stream);
     return slot;
+}
+
+void dsv4_moe_ws_report(Dsv4MoeWs* ws, const char* tag) {
+    if (ws == nullptr || !ws->time_on || ws->moe_calls <= 0) return;
+    const double calls = (double) ws->moe_calls;
+    std::fprintf(stderr,
+                 "dsv4_moe[%s]: host phase ms/call over %lld calls: pre %.3f route-sync %.3f "
+                 "group %.3f chunks %.3f tail %.3f (sum %.3f)\n",
+                 tag, (long long) ws->moe_calls, ws->tm_pre / calls, ws->tm_sync / calls,
+                 ws->tm_group / calls, ws->tm_chunks / calls, ws->tm_tail / calls,
+                 (ws->tm_pre + ws->tm_sync + ws->tm_group + ws->tm_chunks + ws->tm_tail) / calls);
+    if (ws->moe_calls > 0)
+        std::fprintf(stderr, "dsv4_moe[%s]: group sub ms/call: bitmap+groups %.3f peer-admit+split %.3f entry-tables %.3f\n",
+                     tag, ws->tm_g1 / calls, ws->tm_g2 / calls, ws->tm_g3 / calls);
+    if (ws->tev[0] != nullptr)
+        std::fprintf(stderr,
+                     "dsv4_moe[%s]: gpu section ms/call: hc_pre %.3f rmsnorm %.3f gate %.3f "
+                     "route %.3f chunks %.3f peer-collect %.3f shared %.3f hc_post+copy %.3f\n",
+                     tag, ws->tg_hcpre / calls, ws->tg_rms / calls, ws->tg_gate / calls,
+                     ws->tg_topk / calls, ws->tg_chunks / calls, ws->tg_peer / calls,
+                     ws->tg_shared / calls, ws->tg_hcpost / calls);
+    std::fprintf(stderr,
+                 "dsv4_moe[%s]: cold io ms/call: admitted %.2f (read %.3f + h2d %.3f = %.3f/blob)"
+                 " staged %.2f (h2d %.3f) | single-table pack %.3f tab-h2d %.3f launch %.3f"
+                 " | coldpipe %.2f/call (fell back %.2f)/call\n",
+                 tag, (double) ws->cold_n / calls, ws->tm_cold_read / calls,
+                 ws->tm_cold_fill / calls,
+                 ws->cold_n > 0 ? (ws->tm_cold_read + ws->tm_cold_fill) / (double) ws->cold_n : 0.0,
+                 (double) ws->cold_staged_n / calls, ws->tm_cold_staged / calls, ws->tm_pack / calls,
+                 ws->tm_tabh2d / calls, ws->tm_lanch / calls, (double) ws->cold_pipe / calls,
+                 (double) ws->cp.fell_back / calls);
+    std::fprintf(stderr, "dsv4_moe[%s]: coldpipe ring %d slots, %d reader threads, fills %lld\n", tag,
+                 ws->cp.n, ws->cp.threads, (long long) ws->cp.queued);
 }
 
 void dsv4_moe_ws_free(Dsv4MoeWs* ws) {
@@ -1212,37 +1279,7 @@ void dsv4_moe_ws_free(Dsv4MoeWs* ws) {
     for (cudaEvent_t ev : ws->sev)
         if (ev != nullptr) cudaEventDestroy(ev);
     if (ws->sh_stream != nullptr) cudaStreamDestroy(ws->sh_stream);
-    if (ws->time_on && ws->moe_calls > 0) {
-        std::fprintf(stderr,
-                     "dsv4_moe: host phase ms/call over %lld calls: pre %.3f route-sync %.3f "
-                     "group %.3f chunks %.3f tail %.3f (sum %.3f)\n",
-                     (long long) ws->moe_calls, ws->tm_pre / ws->moe_calls,
-                     ws->tm_sync / ws->moe_calls, ws->tm_group / ws->moe_calls,
-                     ws->tm_chunks / ws->moe_calls, ws->tm_tail / ws->moe_calls,
-                     (ws->tm_pre + ws->tm_sync + ws->tm_group + ws->tm_chunks + ws->tm_tail) /
-                         ws->moe_calls);
-        if (ws->tev[0] != nullptr)
-            std::fprintf(stderr,
-                         "dsv4_moe: gpu section ms/call: hc_pre %.3f rmsnorm %.3f gate %.3f "
-                         "route %.3f chunks %.3f peer-collect %.3f shared %.3f hc_post+copy %.3f\n",
-                         ws->tg_hcpre / ws->moe_calls, ws->tg_rms / ws->moe_calls,
-                         ws->tg_gate / ws->moe_calls, ws->tg_topk / ws->moe_calls,
-                         ws->tg_chunks / ws->moe_calls, ws->tg_peer / ws->moe_calls,
-                         ws->tg_shared / ws->moe_calls, ws->tg_hcpost / ws->moe_calls);
-        std::fprintf(stderr,
-                     "dsv4_moe: cold io ms/call: admitted %.2f (read %.3f + h2d %.3f = %.3f/blob)"
-                     " staged %.2f (h2d %.3f) | single-table pack %.3f tab-h2d %.3f launch %.3f"
-                     " | coldpipe %.2f/call (fell back %.2f)/call\n",
-                     (double) ws->cold_n / ws->moe_calls, ws->tm_cold_read / ws->moe_calls,
-                     ws->tm_cold_fill / ws->moe_calls,
-                     ws->cold_n > 0 ? (ws->tm_cold_read + ws->tm_cold_fill) / (double) ws->cold_n : 0.0,
-                     (double) ws->cold_staged_n / ws->moe_calls, ws->tm_cold_staged / ws->moe_calls,
-                     ws->tm_pack / ws->moe_calls, ws->tm_tabh2d / ws->moe_calls,
-                     ws->tm_lanch / ws->moe_calls, (double) ws->cold_pipe / ws->moe_calls,
-                     (double) ws->cp.fell_back / ws->moe_calls);
-        std::fprintf(stderr, "dsv4_moe: coldpipe ring %d slots, %d reader threads, fills %lld\n",
-                     ws->cp.n, ws->cp.threads, (long long) ws->cp.queued);
-    }
+    dsv4_moe_ws_report(ws, "last");
     for (cudaEvent_t& ev : ws->tev)
         if (ev != nullptr) cudaEventDestroy(ev);
     cudaFree(ws->y);
@@ -1608,6 +1645,8 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
         }
         for (int64_t e = 0; e < ws->ne; ++e)
             if (mask[(size_t) (e >> 6)] & (1ull << (e & 63))) groups.push_back((int32_t) e);
+        const auto g1t = ton ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (ton) ws->tm_g1 += std::chrono::duration<double, std::milli>(g1t - tp2).count();
         const unsigned gu_blocks = (unsigned) (inter / (256 / (n / 64)));        // 2048 / 4
         const unsigned d_blocks = (unsigned) (n / (256 / (inter / 64)));         // 4096 / 8
         const uint64_t blob_bytes = (uint64_t) lay.blob_bytes(layer);
@@ -1653,10 +1692,14 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             groups0 = groups;
             for (const int32_t e : groups) in0[(size_t) e] = 1;
         }
+        // (the peer fills are queued on the peer stream before its kernels, and the next layer's
+        // prefetch drains that stream before reusing a slot - no cross-device event needed)
         // entry tables for the device-0 groups.  [S8] one stable bucket pass over the s*nk routing
         // entries (they are already in (token, slot) order, so each group's slice keeps that order and
         // each entry keeps its comb cell) replaces the groups0 x s x nk rescan; the group offsets are
         // the prefix sum of the per-expert counts gathered with the bitmap above.
+        const auto g2t = ton ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (ton) ws->tm_g2 += std::chrono::duration<double, std::milli>(g2t - g1t).count();
         std::vector<int32_t>& ebase = ws->h_ebase;
         std::vector<int32_t>& tokg = ws->h_tokg;
         std::vector<float>& pwg = ws->h_pwg;
@@ -1692,6 +1735,8 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
         // ---- the peer pass: every device-1 group in ONE grouped launch set on device 1.  The slot
         // fills queued above precede the wait on device 0's y; the outputs cross back after the
         // device-0 loop, so device 1 computes while device 0 does its own groups.
+        const auto g3t = ton ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (ton) ws->tm_g3 += std::chrono::duration<double, std::milli>(g3t - g2t).count();
         int64_t entries1 = 0;
         if (!groups1.empty()) {
             Dsv4MoeWs::PeerWs& p = ws->peer;
@@ -1763,18 +1808,20 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             const float* p_pw = (const float*) (p.tab + po_w);
             const dim3 gu_grid1(gu_blocks, (unsigned) max_m1, (unsigned) u1);
             const dim3 d_grid1(d_blocks, (unsigned) max_m1, (unsigned) u1);
-            dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid1, 256, 9216, p.stream>>>(
-                p_ptrs, 0, (int64_t) fmt.tail_off, 0, p.y1, n, p_tok, p_ebase, (int) n, (int) inter,
-                p.gate);
-            dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid1, 256, 9216, p.stream>>>(
-                p_ptrs, (int64_t) fmt.up_off, (int64_t) fmt.tail_off, 1, p.y1, n, p_tok, p_ebase,
-                (int) n, (int) inter, p.up);
-            dsv4_swiglu_clamp_kernel<<<(unsigned) entries1, 256, 0, p.stream>>>(p.gate, p.up, p_pw,
-                                                                                 (int) inter, p.ph,
-                                                                                 1);
-            dsv4_nvfp4_gemv_grouped_kernel<<<d_grid1, 256, 9216, p.stream>>>(
-                p_ptrs, (int64_t) fmt.down_off, (int64_t) fmt.tail_off, 2, p.ph, inter, nullptr,
-                p_ebase, (int) inter, (int) n, p.pout);
+            if (!dsv4_ablit("STRATA_ABL_NOGEMV")) {
+                dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid1, 256, 9216, p.stream>>>(
+                    p_ptrs, 0, (int64_t) fmt.tail_off, 0, p.y1, n, p_tok, p_ebase, (int) n, (int) inter,
+                    p.gate);
+                dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid1, 256, 9216, p.stream>>>(
+                    p_ptrs, (int64_t) fmt.up_off, (int64_t) fmt.tail_off, 1, p.y1, n, p_tok, p_ebase,
+                    (int) n, (int) inter, p.up);
+                dsv4_swiglu_clamp_kernel<<<(unsigned) entries1, 256, 0, p.stream>>>(p.gate, p.up, p_pw,
+                                                                                     (int) inter, p.ph,
+                                                                                     1);
+                dsv4_nvfp4_gemv_grouped_kernel<<<d_grid1, 256, 9216, p.stream>>>(
+                    p_ptrs, (int64_t) fmt.down_off, (int64_t) fmt.tail_off, 2, p.ph, inter, nullptr,
+                    p_ebase, (int) inter, (int) n, p.pout);
+            }
             CKM(cudaGetLastError());
             CKM(cudaEventRecord(p.ev_done, p.stream));
             CKM(cudaSetDevice(0));
@@ -1870,19 +1917,21 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             const int32_t* k_slot = (const int32_t*) (ws->tab + o_s);
             const dim3 gu_grid(gu_blocks, (unsigned) max_m, (unsigned) n_groups);
             const dim3 d_grid(d_blocks, (unsigned) max_m, (unsigned) n_groups);
-            dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid, 256, 9216, stream>>>(
-                k_ptrs, 0, (int64_t) fmt.tail_off, 0, ws->yt, n, k_tok, k_ebase, (int) n, (int) inter,
-                ws->gate);
-            dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid, 256, 9216, stream>>>(
-                k_ptrs, (int64_t) fmt.up_off, (int64_t) fmt.tail_off, 1, ws->yt, n, k_tok, k_ebase,
-                (int) n, (int) inter, ws->up);
-            dsv4_swiglu_clamp_kernel<<<(unsigned) entries, 256, 0, stream>>>(ws->gate, ws->up, k_pw,
-                                                                             (int) inter, ws->ph, 1);
-            dsv4_nvfp4_gemv_grouped_kernel<<<d_grid, 256, 9216, stream>>>(
-                k_ptrs, (int64_t) fmt.down_off, (int64_t) fmt.tail_off, 2, ws->ph, inter, nullptr,
-                k_ebase, (int) inter, (int) n, ws->pout);
-            dsv4_scatter_rows_kernel<<<(unsigned) entries, 256, 0, stream>>>(ws->pout, k_slot,
-                                                                            ws->comb6, n);
+            if (!dsv4_ablit("STRATA_ABL_NOGEMV")) {
+                dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid, 256, 9216, stream>>>(
+                    k_ptrs, 0, (int64_t) fmt.tail_off, 0, ws->yt, n, k_tok, k_ebase, (int) n, (int) inter,
+                    ws->gate);
+                dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid, 256, 9216, stream>>>(
+                    k_ptrs, (int64_t) fmt.up_off, (int64_t) fmt.tail_off, 1, ws->yt, n, k_tok, k_ebase,
+                    (int) n, (int) inter, ws->up);
+                dsv4_swiglu_clamp_kernel<<<(unsigned) entries, 256, 0, stream>>>(ws->gate, ws->up, k_pw,
+                                                                                 (int) inter, ws->ph, 1);
+                dsv4_nvfp4_gemv_grouped_kernel<<<d_grid, 256, 9216, stream>>>(
+                    k_ptrs, (int64_t) fmt.down_off, (int64_t) fmt.tail_off, 2, ws->ph, inter, nullptr,
+                    k_ebase, (int) inter, (int) n, ws->pout);
+                dsv4_scatter_rows_kernel<<<(unsigned) entries, 256, 0, stream>>>(ws->pout, k_slot,
+                                                                                ws->comb6, n);
+            }
             if (ton) {
                 const auto pt3 = std::chrono::steady_clock::now();
                 ws->tm_pack += std::chrono::duration<double, std::milli>(pt1 - pt0).count();
@@ -1909,8 +1958,13 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                         return false;
                     }
                     dst = ws->blob_stage + (size_t) zz * blob_bytes;
-                    CKM(cudaMemcpyAsync(dst, blob, (size_t) blob_bytes, cudaMemcpyHostToDevice,
-                                        stream));
+                    if (dsv4_ablit("STRATA_ABL_NOREAD")) blob = dsv4_abl_scratch((size_t) blob_bytes);
+                    if (dsv4_ablit("STRATA_ABL_NODMA")) {
+                        uint8_t* scratch = dsv4_abl_scratch((size_t) blob_bytes);
+                        if (scratch != nullptr) std::memcpy(scratch, blob, (size_t) blob_bytes);
+                    } else if (!dsv4_ablit("STRATA_ABL_NOCOPY"))
+                        CKM(cudaMemcpyAsync(dst, blob, (size_t) blob_bytes, cudaMemcpyHostToDevice,
+                                            stream));
                     if (ton) {
                         ws->tm_cold_read += std::chrono::duration<double, std::milli>(st1 - st0).count();
                         ws->tm_cold_staged +=
@@ -1960,19 +2014,21 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             const int32_t* k_slot = (const int32_t*) (ws->tab + o_s);
             const dim3 gu_grid(gu_blocks, (unsigned) max_m, (unsigned) u);
             const dim3 d_grid(d_blocks, (unsigned) max_m, (unsigned) u);
-            dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid, 256, 9216, stream>>>(
-                k_ptrs, 0, (int64_t) fmt.tail_off, 0, ws->yt, n, k_tok, k_ebase, (int) n, (int) inter,
-                ws->gate);
-            dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid, 256, 9216, stream>>>(
-                k_ptrs, (int64_t) fmt.up_off, (int64_t) fmt.tail_off, 1, ws->yt, n, k_tok, k_ebase,
-                (int) n, (int) inter, ws->up);
-            dsv4_swiglu_clamp_kernel<<<(unsigned) entries, 256, 0, stream>>>(ws->gate, ws->up, k_pw,
-                                                                             (int) inter, ws->ph, 1);
-            dsv4_nvfp4_gemv_grouped_kernel<<<d_grid, 256, 9216, stream>>>(
-                k_ptrs, (int64_t) fmt.down_off, (int64_t) fmt.tail_off, 2, ws->ph, inter, nullptr,
-                k_ebase, (int) inter, (int) n, ws->pout);
-            dsv4_scatter_rows_kernel<<<(unsigned) entries, 256, 0, stream>>>(ws->pout, k_slot,
-                                                                            ws->comb6, n);
+            if (!dsv4_ablit("STRATA_ABL_NOGEMV")) {
+                dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid, 256, 9216, stream>>>(
+                    k_ptrs, 0, (int64_t) fmt.tail_off, 0, ws->yt, n, k_tok, k_ebase, (int) n, (int) inter,
+                    ws->gate);
+                dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid, 256, 9216, stream>>>(
+                    k_ptrs, (int64_t) fmt.up_off, (int64_t) fmt.tail_off, 1, ws->yt, n, k_tok, k_ebase,
+                    (int) n, (int) inter, ws->up);
+                dsv4_swiglu_clamp_kernel<<<(unsigned) entries, 256, 0, stream>>>(ws->gate, ws->up, k_pw,
+                                                                                 (int) inter, ws->ph, 1);
+                dsv4_nvfp4_gemv_grouped_kernel<<<d_grid, 256, 9216, stream>>>(
+                    k_ptrs, (int64_t) fmt.down_off, (int64_t) fmt.tail_off, 2, ws->ph, inter, nullptr,
+                    k_ebase, (int) inter, (int) n, ws->pout);
+                dsv4_scatter_rows_kernel<<<(unsigned) entries, 256, 0, stream>>>(ws->pout, k_slot,
+                                                                                ws->comb6, n);
+            }
         }
         }
         if (tev_ok) CKM(cudaEventRecord(ws->tev[1], stream));

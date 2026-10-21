@@ -656,8 +656,9 @@ namespace {
 // pipeline is not disturbed) and read once at exit -> true per-shape GPU duration.
 struct Q8TimeAcc {
     static constexpr int kMax = 65536;
-    double ms[7] = {0, 0, 0, 0, 0, 0, 0};
-    long n[7] = {0, 0, 0, 0, 0, 0, 0};
+    static constexpr int kCls = 8;
+    double ms[kCls] = {0, 0, 0, 0, 0, 0, 0, 0};
+    long n[kCls] = {0, 0, 0, 0, 0, 0, 0, 0};
     bool on = false;
     int used = 0;
     cudaEvent_t* ev = nullptr;
@@ -685,10 +686,10 @@ struct Q8TimeAcc {
             if (tf != nullptr) std::fprintf(tf, "%d %d %.4f\n", i, (int) cls[i], el);
         }
         if (tf != nullptr) std::fclose(tf);
-        const char* nm[7] = {"wq_a", "wq_b", "wkv", "wo_a", "wo_b", "idx", "other"};
+        const char* nm[8] = {"wq_a", "wq_b", "wkv", "wo_a", "wo_b", "idx", "other", "mqa512"};
         double tot = 0;
         long all = 0;
-        for (int i = 0; i < 7; ++i) {
+        for (int i = 0; i < 8; ++i) {
             tot += ms[i];
             all += n[i];
             if (n[i])
@@ -761,7 +762,7 @@ Q8CmpAcc g_q8cmp;
 // "kernel is slow" from "something else is using DRAM at the same time".
 int g_q8rep = -1;
 int g_q8rep_at = 44;  // call index within a shape (43 layers/pass -> 44 = decode1 layer 0)
-int g_q8rep_done[7] = {0, 0, 0, 0, 0, 0, 0};
+int g_q8rep_done[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 }  // namespace
 
 void gemm_q8(const uint8_t* w, int rows, int cols, int group_rows, const float* x, int m,
@@ -902,8 +903,10 @@ void rope_rows(float* x, int rows, int width, int half, int rows_per_token,
 void mqa512(const float* q, const float* kv, const int32_t* topk, const float* sinks, int s, int K,
             int slots, float scale, float* out, cudaStream_t stream) {
     const size_t smem = (size_t)(kHeadDim + K) * 4;
+    g_q8time.begin(7, stream);
     dsv4_mqa512_kernel<<<s * kNHead, 128, smem, stream>>>(q, kv, topk, sinks, kNHead, kHeadDim, K,
                                                           slots, scale, out);
+    g_q8time.end(stream);
     DSV4_CK(cudaGetLastError());
 }
 

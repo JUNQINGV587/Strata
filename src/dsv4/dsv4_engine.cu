@@ -1266,7 +1266,9 @@ bool forward_tail(const Options& o, Model& m, std::string& err) {
             }
         }
         // dump post_moe from the state the MoE half left
-        if (std::getenv("STRATA_DSV4_LAYERTIME") != nullptr && (layer < 4 || layer == g.n_layers - 1))
+        if (std::getenv("STRATA_DSV4_LAYERTIME") != nullptr &&
+            (std::getenv("STRATA_DSV4_LAYERTIME_ALL") != nullptr || layer < 4 ||
+             layer == g.n_layers - 1))
             std::fprintf(stderr, "layertime %s L%02lld attn %.3f moe %.3f\n", pass.c_str(),
                          (long long) layer,
                          std::chrono::duration<double, std::milli>(lt1 - lt0).count(),
@@ -1350,6 +1352,23 @@ bool forward_tail(const Options& o, Model& m, std::string& err) {
     if (o.prompt_ids.empty())
         std::fprintf(stderr, "strata-dsv4: prefill argmax %lld vs golden 9544: %s\n", (long long) cur,
                      cur == 9544 ? "MATCH" : "MISMATCH");
+    if (eton) {  // [diag] the prefill split, before the accumulators are reset for the decode passes
+        std::fprintf(stderr,
+                     "strata-dsv4: prefill phase ms: embed %.3f attn %.3f (gpu %.3f) moe %.3f "
+                     "tail %.3f (sum %.3f)\n",
+                     etm_embed, etm_attn, etm_attn_gpu, etm_moe, etm_tail,
+                     etm_embed + etm_attn + etm_moe + etm_tail);
+        std::fprintf(stderr,
+                     "strata-dsv4: prefill attn gpu ms/call by class: hash %.3f (n=%lld) r128 %.3f "
+                     "(n=%lld) idx %.3f (n=%lld)\n",
+                     etm_attn_clsn[0] ? etm_attn_cls[0] / etm_attn_clsn[0] : 0,
+                     (long long) etm_attn_clsn[0],
+                     etm_attn_clsn[1] ? etm_attn_cls[1] / etm_attn_clsn[1] : 0,
+                     (long long) etm_attn_clsn[1],
+                     etm_attn_clsn[2] ? etm_attn_cls[2] / etm_attn_clsn[2] : 0,
+                     (long long) etm_attn_clsn[2]);
+        strata::dsv4::dsv4_moe_ws_report(moe_ws, "prefill");
+    }
     static const int64_t kGoldenGen[3] = {734, 260, 4654};
     std::vector<int32_t> all = ids32;
     if (eton) {  // [S7b] report decode-only splits: drop the prefill pass from the accumulators
