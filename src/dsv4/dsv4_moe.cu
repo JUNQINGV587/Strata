@@ -702,8 +702,17 @@ struct Dsv4MoeWs {
     // quota is full swaps out the coldest resident when clearly hotter (STRATA_DSV4_EVICT_GAIN,
     // default 1.25).  Empty table (no profile seed): eviction off, first-touch only (S7a policy).
     std::vector<float> heat;           // n_layers * ne, indexed [layer * ne + expert]
-    double evict_gain = 1.25;
+    double evict_gain = 1.0;           // [A1] 1.25 measured no better than 1.0 (pfevict/sim-4k-sweep)
     int64_t evictions = 0;
+    // [A1] global-pool eviction: with `STRATA_DSV4_EVICT_SCOPE=global` (default) the caches are opened
+    // without per-layer slot ranges and a miss may evict the coldest resident of ANY layer of that
+    // cache, not just of its own layer.  `hmin[dev][layer]` caches the coldest heat among that layer's
+    // residents so the cross-layer scan is 43 comparisons instead of 43*256 lookups; `hmin_dirty`
+    // invalidates a layer whose resident set or heat row changed.  Only consulted for s >= pf.min_s,
+    // so the decode pass (s<=6) keeps the old same-layer policy exactly.
+    std::vector<float> hmin[2];
+    std::vector<unsigned char> hmin_dirty[2];
+    int64_t call_s = 0;                // s of the call in flight (set by dsv4_moe_half)
     // [S7b] GPU-section events (STRATA_DSV4_TIME): stream-time split of the GPU branch
     cudaEvent_t tev[10] = {};
     // [S7e] the shared expert reads the normed input but never the routing decision, so it runs on its
@@ -748,6 +757,20 @@ struct Dsv4MoeWs {
         int64_t staged = 0, staged_pf = 0, blob_calls = 0, pf_reads = 0;
         uint64_t dma_bytes = 0, dma_pf_bytes = 0;
         bool pin_idx = false, pin_wgt = false;
+        /// [A0] cache-policy diagnosis.  Per-layer counters for BOTH caches: the peer path used to
+        /// bump only the global hit counter, so every device-1 miss (admitted, failed, or evicted
+        /// into) was invisible and the printed hit rate described device 0's traffic only.  The
+        /// `why_*` counters split a miss that could not be admitted by cause, which is what tells a
+        /// quota ceiling apart from an eviction-policy rejection.
+        struct PlStat {
+            int64_t hit = 0;        ///< slot_of() found the expert
+            int64_t miss = 0;       ///< not resident: admission attempted
+            int64_t adm_free = 0;   ///<   ... admitted because a free slot existed
+            int64_t adm_evict = 0;  ///<   ... admitted by replacing a colder resident
+            int64_t no_slot = 0;    ///<   ... not admitted (staged on device 0 instead)
+        };
+        std::vector<PlStat> pl[2];   ///< [device][layer], sized by dsv4_moe_ws_set_layers
+        int64_t why_free = 0, why_evict = 0, why_noheat = 0, why_gate = 0, why_novictim = 0;
     } pft;
     /// [S9] The cold-blob pipeline: a small ring of page-locked blob-sized slots.  A cold expert is
     /// read into a ring slot, then copied to its cache slot by a DMA queued on a BYPASS stream, and
@@ -1048,6 +1071,21 @@ Dsv4MoeWs* dsv4_moe_ws_new(const Dsv4Geometry& g, int64_t s, std::string& err) {
 void dsv4_moe_ws_set_layers(Dsv4MoeWs* ws, int n_layers) {
     if (!ws) return;
     ws->n_layers = n_layers;
+    // [A0] per-layer cache counters are allocated here: the layer count arrives after ws_new and
+    // before the first MoE call, and a run without PFTIME keeps them empty (no allocation).
+    if (ws->pft.on) {
+        for (int d = 0; d < 2; ++d)
+            ws->pft.pl[d].assign((size_t) n_layers, Dsv4MoeWs::PfTime::PlStat{});
+    }
+    // [A1] the cross-layer victim scan's per-layer minima.  Allocated here (n_layers arrives after
+    // ws_new, same reason as the counters above) and every layer starts dirty, so the first scan
+    // after the profile prefill sees the real resident set.
+    if (n_layers > 0) {
+        for (int d = 0; d < 2; ++d) {
+            ws->hmin[d].assign((size_t) n_layers, std::numeric_limits<float>::max());
+            ws->hmin_dirty[d].assign((size_t) n_layers, 1);
+        }
+    }
     if (ws->route_dump) {
         std::fwrite("RTE1", 1, 4, ws->route_dump);
         const uint32_t hdr[3] = {(uint32_t) n_layers, (uint32_t) ws->ne, (uint32_t) ws->nk};
@@ -1114,6 +1152,7 @@ void dsv4_moe_ws_cache_stats(const Dsv4MoeWs* ws, int64_t& hits, int64_t& misses
 void dsv4_moe_ws_set_heat(Dsv4MoeWs* ws, const float* heat, int64_t n) {
     if (!ws || !heat || n <= 0) return;
     ws->heat.assign(heat, heat + n);
+    for (int d = 0; d < 2; ++d) std::fill(ws->hmin_dirty[d].begin(), ws->hmin_dirty[d].end(), 1);
 }
 
 int64_t dsv4_moe_ws_evictions(const Dsv4MoeWs* ws) { return ws ? ws->evictions : 0; }
@@ -1368,18 +1407,51 @@ static void dsv4_pf_join(Dsv4MoeWs* ws) {
     ws->pf.workers.clear();
 }
 
+// [A1] The coldest heat among `C`'s residents of layer `l`, refreshed only when this call's heat
+// update or an admission in that layer invalidated it.  Empty layers keep `max()` so they never win
+// the cross-layer scan; the scan itself then rescans the winning layer for the actual expert id,
+// which is 256 lookups once per miss instead of a cached argmin that could go stale.
+static float dsv4_hmin(Dsv4MoeWs* ws, strata::core::ExpertCache* C, int dev, int64_t l) {
+    if (l < 0 || l >= ws->n_layers) return std::numeric_limits<float>::max();
+    if ((size_t) l >= ws->hmin[dev].size()) return std::numeric_limits<float>::max();
+    if (ws->hmin_dirty[dev][(size_t) l]) {
+        const float* h = ws->heat.data() + (size_t) l * ws->ne;
+        float m = std::numeric_limits<float>::max();
+        for (int64_t e = 0; e < ws->ne; ++e) {
+            if (C->slot_of(l, e) < 0) continue;
+            if (h[e] < m) m = h[e];
+        }
+        ws->hmin[dev][(size_t) l] = m;
+        ws->hmin_dirty[dev][(size_t) l] = 0;
+    }
+    return ws->hmin[dev][(size_t) l];
+}
+
 // [S7b] one miss's slot: admit first-touch; when the layer's quota is full, swap the coldest
 // resident of the same layer - never one this pass routed (its slot is about to be read) - for a
 // clearly hotter new expert.  The fill is queued on `stream` either way, so the slot's bytes are
 // ordered before every kernel that reads them on that stream.  kNotResident = staging fallback.
+// [A0] `why` (nullable) reports the path taken: 0 free slot, 1 evicted a colder resident, 2 no free
+// slot and no heat table (eviction off), 3 a victim existed but was not clearly colder, 4 no
+// eligible victim at all, 5 an I/O error.  Diagnostics only - it changes no decision.
+// [A1] When the cache was opened WITHOUT per-layer ranges (the global pool) and this is a prefill
+// pass (s >= pf.min_s), the victim search widens to every resident of the whole cache, so a layer
+// that over-routes this pass can borrow from one that under-routes instead of staging a blob.  The
+// narrow pass (s <= 6, decode) keeps the same-layer search exactly, so its residency behaviour is
+// unchanged.
+enum : int { kAdmFree = 0, kAdmEvict = 1, kAdmNoHeat = 2, kAdmGate = 3, kAdmNoVictim = 4, kAdmIoErr = 5 };
 static int32_t dsv4_admit_heat(Dsv4MoeWs* ws, strata::core::ExpertCache* C,
                                strata::core::FileExpertSource& experts, int64_t layer, int32_t e,
                                const std::vector<int32_t>& routed, cudaStream_t stream,
-                               int64_t blob_bytes, std::string& err, bool& failed, int dev = 0) {
+                               int64_t blob_bytes, std::string& err, bool& failed, int dev = 0,
+                               int* why = nullptr) {
     failed = false;
+    if (why != nullptr) *why = kAdmFree;
+    const bool global_scope = !C->per_layer_admission() && ws->call_s >= ws->pf.min_s;
     int32_t slot = C->admit(layer, e);
     if (slot < 0 && !ws->heat.empty()) {
         const float* hrow = ws->heat.data() + (size_t) layer * ws->ne;
+        int64_t vl = layer;
         int32_t victim = -1;
         float vmin = std::numeric_limits<float>::max();
         for (int64_t e2 = 0; e2 < ws->ne; ++e2) {
@@ -1390,13 +1462,49 @@ static int32_t dsv4_admit_heat(Dsv4MoeWs* ws, strata::core::ExpertCache* C,
                 victim = (int32_t) e2;
             }
         }
-        if (victim >= 0 && hrow[e] > vmin * (float) ws->evict_gain) {
-            slot = C->slot_of(layer, victim);
-            C->replace(layer, victim, e);
-            ++ws->evictions;
+        if (global_scope && (size_t) ws->n_layers * ws->ne == ws->heat.size()) {
+            int64_t cold_l = -1;
+            float cold = vmin;
+            for (int64_t l2 = 0; l2 < ws->n_layers; ++l2) {
+                if (l2 == layer) continue;
+                const float m = dsv4_hmin(ws, C, dev, l2);
+                if (m < cold) { cold = m; cold_l = l2; }
+            }
+            if (cold_l >= 0) {
+                const float* h2 = ws->heat.data() + (size_t) cold_l * ws->ne;
+                float b2 = std::numeric_limits<float>::max();
+                int32_t e2b = -1;
+                for (int64_t e2 = 0; e2 < ws->ne; ++e2) {
+                    if (C->slot_of(cold_l, e2) < 0) continue;
+                    if (h2[e2] < b2) { b2 = h2[e2]; e2b = (int32_t) e2; }
+                }
+                if (e2b >= 0) { vmin = b2; vl = cold_l; victim = e2b; }
+            }
         }
+        if (victim < 0) {
+            if (why != nullptr) *why = kAdmNoVictim;
+        } else if (hrow[e] > vmin * (float) ws->evict_gain) {
+            if (vl == layer) {
+                slot = C->slot_of(layer, victim);
+                C->replace(layer, victim, e);
+            } else {
+                slot = C->replace_across(vl, victim, layer, e);
+            }
+            if (slot >= 0) {
+                ++ws->evictions;
+                ws->hmin_dirty[dev][(size_t) vl] = 1;
+                if (why != nullptr) *why = kAdmEvict;
+            }
+        } else if (why != nullptr) {
+            *why = kAdmGate;
+        }
+    } else if (slot < 0 && why != nullptr) {
+        *why = kAdmNoHeat;
     }
     if (slot < 0) return strata::core::kNotResident;
+    // [A1] the newcomer is (or will be, once the fill lands) a resident of `layer`: its heat can be
+    // the layer's new minimum, so the cached one must be rebuilt before the next scan trusts it.
+    if ((size_t) layer < ws->hmin_dirty[dev].size()) ws->hmin_dirty[dev][(size_t) layer] = 1;
     // [S9c] the pinned, multi-threaded fill: the host pays the read (~0.7 ms) but not the pageable
     // bounce (~2.1 ms); a full ring falls through to the old in-line copy.
     if (ws->cp.on && dsv4_cp_fill(ws, C, experts, layer, e, slot, stream, dev, blob_bytes, err)) {
@@ -1416,6 +1524,7 @@ static int32_t dsv4_admit_heat(Dsv4MoeWs* ws, strata::core::ExpertCache* C,
     if (!blob) {
         err = "dsv4_moe: no blob for the routed expert";
         failed = true;
+        if (why != nullptr) *why = kAdmIoErr;
         return strata::core::kNotResident;
     }
     if (dsv4_ablit("STRATA_ABL_NOREAD")) blob = dsv4_abl_scratch((size_t) blob_bytes);
@@ -1429,6 +1538,7 @@ static int32_t dsv4_admit_heat(Dsv4MoeWs* ws, strata::core::ExpertCache* C,
     if (!dsv4_ablit("STRATA_ABL_NOCOPY") &&
         !C->fill_slot(slot, blob, (void*) fill_stream, err, blob_bytes)) {
         failed = true;
+        if (why != nullptr) *why = kAdmIoErr;
         return strata::core::kNotResident;
     }
     if (ws->time_on) {
@@ -1497,6 +1607,49 @@ void dsv4_moe_ws_report(Dsv4MoeWs* ws, const char* tag) {
                      p.staged_pf / n, p.blob_calls / n, p.pf_reads / n, (double) p.dma_bytes / n / 1048576.0,
                      (double) p.dma_pf_bytes / n / 1048576.0, p.launches / n, p.hit0 / n, p.miss0 / n,
                      p.admit0 / n, p.fail0 / n, p.hit1 / n, p.miss1 / n, p.admit1 / n, p.fail1 / n);
+        // [A0] why a miss was not admitted, and the per-layer shape of the traffic.  The first line
+        // is the diagnostic's point: a quota ceiling shows up as kAdmNoHeat/kAdmGate/kAdmNoVictim
+        // with free slots left over, whereas a genuine capacity ceiling shows up as
+        // adm_free == 0 with every cache full.
+        const int64_t nmiss = p.why_free + p.why_evict + p.why_noheat + p.why_gate + p.why_novictim;
+        std::fprintf(stderr,
+                     "dsv4_cachediag[%s]: miss path per call: free-slot %.2f evict %.2f no-heat %.2f"
+                     " gate-reject %.2f no-victim %.2f (of %.2f misses)\n",
+                     tag, p.why_free / n, p.why_evict / n, p.why_noheat / n, p.why_gate / n,
+                     p.why_novictim / n, (double) nmiss / n);
+        for (int d = 0; d < 2; ++d) {
+            strata::core::ExpertCache* C = ws->cache[d];
+            if (C == nullptr || p.pl[d].empty()) continue;
+            int64_t lo = 0, hi = 0, hsum = 0, msum = 0, asum = 0, esum = 0, nsum = 0;
+            C->layer_slot_range(0, lo, hi);
+            const int64_t q0 = hi - lo;
+            C->layer_slot_range((int64_t) p.pl[d].size() - 1, lo, hi);
+            const int64_t qlast = hi - lo;
+            for (const Dsv4MoeWs::PfTime::PlStat& st : p.pl[d]) {
+                hsum += st.hit;
+                msum += st.miss;
+                asum += st.adm_free;
+                esum += st.adm_evict;
+                nsum += st.no_slot;
+            }
+            std::fprintf(stderr,
+                         "dsv4_cachediag[%s]: dev%d slots %lld resident %lld quota/layer %lld (last %lld)"
+                         " admission %s | totals hit %lld miss %lld (%.1f%%) admit free %lld evict"
+                         " %lld no-slot %lld\n",
+                         tag, d, (long long) C->slots(), (long long) C->resident(), (long long) q0,
+                         (long long) qlast,
+                         C->per_layer_admission() ? "per-layer" : "global", (long long) hsum,
+                         (long long) msum,
+                         hsum + msum > 0 ? 100.0 * (double) hsum / (double) (hsum + msum) : 0.0,
+                         (long long) asum, (long long) esum, (long long) nsum);
+            std::fprintf(stderr, "dsv4_cachediag[%s]: dev%d hit  ", tag, d);
+            for (const Dsv4MoeWs::PfTime::PlStat& st : p.pl[d]) std::fprintf(stderr, " %lld", (long long) st.hit);
+            std::fprintf(stderr, "\ndsv4_cachediag[%s]: dev%d miss ", tag, d);
+            for (const Dsv4MoeWs::PfTime::PlStat& st : p.pl[d]) std::fprintf(stderr, " %lld", (long long) st.miss);
+            std::fprintf(stderr, "\ndsv4_cachediag[%s]: dev%d evict", tag, d);
+            for (const Dsv4MoeWs::PfTime::PlStat& st : p.pl[d]) std::fprintf(stderr, " %lld", (long long) st.adm_evict);
+            std::fprintf(stderr, "\n");
+        }
     }
 }
 
@@ -1717,6 +1870,9 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
     // (decode runs s_cur=1 against a prefill-sized workspace). Every launch below uses the
     // runtime s, and all buffers were sized for ws->s rows in dsv4_moe_ws_new.
     if (!ws || ws->s < s) { err = "dsv4_moe: workspace/token-count mismatch"; return false; }
+    // [A1] the call's row count decides whether a miss may borrow a slot across layers: prefill-sized
+    // passes do, the narrow decode pass (s <= pf.min_s) keeps the same-layer policy.
+    ws->call_s = s;
     if (!w.ffn_norm || !w.gate_w || !w.hc_fn || !w.hc_base || !w.hc_scale || !w.sh_gate || !w.sh_up ||
         !w.sh_down) {
         err = "dsv4_moe: missing layer weights (ffn_norm/gate_w/hc_ffn_*/shared expert)";
@@ -1819,6 +1975,10 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
         float* hrow = ws->heat.data() + (size_t) layer * ne;
         for (int64_t j = 0; j < s; ++j)
             for (int64_t k = 0; k < nk; ++k) ++hrow[ws->h_idx[(size_t) (j * nk + k)]];
+        // [A1] the whole table may have moved (the pass decay) and this layer's row just did: the
+        // per-layer minima the cross-layer scan trusts are rebuilt on first use this call.
+        for (int d = 0; d < 2; ++d)
+            std::fill(ws->hmin_dirty[d].begin(), ws->hmin_dirty[d].end(), 1);
     }
     if (ws->debug_dir) {
         char path[640];
@@ -1958,11 +2118,33 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                 int32_t slot = C->slot_of(layer, e);
                 if (slot >= 0) {
                     ++ws->cache_hits;
+                    if (pft_on) {
+                        ++ws->pft.hit1;
+                        ++ws->pft.pl[1][(size_t) layer].hit;
+                    }
                 } else {
                     bool failed = false;
+                    int why = kAdmFree;
                     slot = dsv4_admit_heat(ws, C, experts, layer, e, groups, ws->peer.stream,
-                                           (int64_t) blob_bytes, err, failed, 1);
+                                           (int64_t) blob_bytes, err, failed, 1, &why);
                     if (failed) return false;
+                    // [A0] device 1's misses used to be counted nowhere: the printed hit rate was
+                    // (device-0 hits + device-1 hits) / device-0 groups, so it overstated the real
+                    // one.  Count them in the same totals as device 0's.
+                    ++ws->cache_misses;
+                    if (pft_on) {
+                        Dsv4MoeWs::PfTime::PlStat& st = ws->pft.pl[1][(size_t) layer];
+                        ++ws->pft.miss1;
+                        ++st.miss;
+                        if (slot >= 0) {
+                            ++ws->pft.admit1;
+                            if (why == kAdmEvict) ++st.adm_evict;
+                            else ++st.adm_free;
+                        } else {
+                            ++ws->pft.fail1;
+                            ++st.no_slot;
+                        }
+                    }
                 }
                 if (slot >= 0) {
                     groups1.push_back(e);
@@ -2145,18 +2327,39 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                 if (resident >= 0) {
                     dst = C->device_slot(resident);
                     ++ws->cache_hits;
-                    if (pft_on) ++ws->pft.hit0;
+                    if (pft_on) {
+                        ++ws->pft.hit0;
+                        ++ws->pft.pl[0][(size_t) layer].hit;
+                    }
                 } else {
                     bool failed = false;
+                    int why = kAdmFree;
                     const int32_t slot = dsv4_admit_heat(ws, C, experts, layer, e, groups0, stream,
-                                                         (int64_t) blob_bytes, err, failed);
+                                                         (int64_t) blob_bytes, err, failed, 0, &why);
                     if (failed) return false;
                     if (slot >= 0) dst = C->device_slot(slot);
                     ++ws->cache_misses;
                     if (pft_on) {
+                        Dsv4MoeWs::PfTime::PlStat& st = ws->pft.pl[0][(size_t) layer];
                         ++ws->pft.miss0;
-                        if (slot >= 0) { ++ws->pft.admit0; ws->pft.dma_bytes += blob_bytes; }
-                        else ++ws->pft.fail0;
+                        ++st.miss;
+                        if (slot >= 0) {
+                            ++ws->pft.admit0;
+                            ws->pft.dma_bytes += blob_bytes;
+                            if (why == kAdmEvict) ++st.adm_evict;
+                            else ++st.adm_free;
+                        } else {
+                            ++ws->pft.fail0;
+                            ++st.no_slot;
+                        }
+                        switch (why) {
+                            case kAdmFree: ++ws->pft.why_free; break;
+                            case kAdmEvict: ++ws->pft.why_evict; break;
+                            case kAdmNoHeat: ++ws->pft.why_noheat; break;
+                            case kAdmGate: ++ws->pft.why_gate; break;
+                            case kAdmNoVictim: ++ws->pft.why_novictim; break;
+                            default: break;
+                        }
                     }
                 }
             }

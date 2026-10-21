@@ -445,13 +445,26 @@ bool load(const Options& o, Model& m, std::string& err) {
     }
     // ---- [S7a-3] the VRAM expert tier: every free GiB of BOTH cards as expert slot arenas.  A routed
     // expert's home is cache[expert & 1] (with the peer cache off, everything homes to cache 0); the
-    // MoE path admits first-touch under per-layer slot budgets (ExpertCache's R4.2g: no layer may take
-    // another's slots) and never evicts.  The fill doubles as the copy the kernel reads, so a miss costs
-    // exactly the staging H2D the uncached path paid and a hit costs nothing.  Device-1 experts are
+    // MoE path admits first-touch and evicts the coldest resident of the same CACHE (A1: across layers
+    // by default, within one layer under STRATA_DSV4_EVICT_SCOPE=layer).  The fill doubles as the copy
+    // the kernel reads, so a miss costs exactly the staging H2D the uncached path paid and a hit costs
+    // nothing.  Device-1 experts are
     // COMPUTED on device 1 (a device-0 kernel reading device-1 slots over P2P measures ~0.9 GiB/s
     // inside the GEMV - only the 16 KiB/token input and the outputs cross PCIe).  STRATA_DSV4_CACHE=0
     // opts out, STRATA_DSV4_CACHE1=0 leaves the peer card out, STRATA_DSV4_CACHE_SLOTS0/1 pin the
     // slot counts.
+    // ---- [A1] eviction scope.  `STRATA_DSV4_EVICT_SCOPE=layer` restores R4.2g's per-layer slot ranges
+    // and the same-layer victim search exactly (the pre-A1 behaviour); the default `global` opens each
+    // pool with no per-layer ranges, so a miss may take the slot of the coldest resident of ANY layer
+    // in that cache (dsv4_moe.cu's dsv4_admit_heat).  Why: one 4k MoE call routes ~124 experts while a
+    // layer's quota is slots/n_layers ~= 65 on device 0, so the quota rejects admissions the pool as a
+    // whole has room for.  Measured on the run's own route trace
+    // (runs/202610-dsv4-mvp/pfevict/sim-4k-sweep.txt): quota+prior100 72.3% vs global+prior0 82.7%
+    // true hit rate at the same 6325 slots.
+    const bool evict_global = [] {
+        const char* s = std::getenv("STRATA_DSV4_EVICT_SCOPE");
+        return s == nullptr || std::strcmp(s, "layer") != 0;
+    }();
     if (const char* v = std::getenv("STRATA_DSV4_CACHE"); v == nullptr || std::atoi(v) != 0) {
         const uint64_t blob = (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
         auto env_slots = [](const char* name, int64_t dflt) {
@@ -464,7 +477,7 @@ bool load(const Options& o, Model& m, std::string& err) {
         const int64_t slots0 = env_slots("STRATA_DSV4_CACHE_SLOTS0",
                                          (int64_t) ((free0 - 1500ull * 1048576) / blob));
         if (slots0 > 0) {
-            m.cache[0].set_per_layer_admission(true);
+            m.cache[0].set_per_layer_admission(!evict_global);
             if (!m.cache[0].open(slots0, g.n_layers, g.n_expert, (int64_t) blob, err)) return false;
             std::fprintf(stderr, "strata-dsv4: expert cache: device 0: %lld slots (%.1f%% of the pool, %.1f GiB)\n",
                          (long long) m.cache[0].slots(),
@@ -479,7 +492,7 @@ bool load(const Options& o, Model& m, std::string& err) {
                 const int64_t slots1 = env_slots("STRATA_DSV4_CACHE_SLOTS1",
                                                  (int64_t) ((free1 - 700ull * 1048576) / blob));
                 if (slots1 > 0) {
-                    m.cache[1].set_per_layer_admission(true);
+                    m.cache[1].set_per_layer_admission(!evict_global);
                     if (!m.cache[1].open(slots1, g.n_layers, g.n_expert, (int64_t) blob, err))
                         return false;
                 }
@@ -540,16 +553,23 @@ bool load(const Options& o, Model& m, std::string& err) {
                 if (!m.cache[d].sync_queued(err)) return false;
                 CK(cudaSetDevice(0));
             }
-            // seed the online heat: rank 0 is hottest, the unranked stay cold
+            // seed the online heat: rank 0 is hottest, the unranked stay cold.
+            // [A1] STRATA_DSV4_EVICT_PRIOR (0..100, default 0) scales that seed.  It is a PREDICTION of
+            // how good each profiled expert will be, and a large one drowns the online counts for the
+            // 4266 profiled pairs, so the eviction gate almost never fires on them.  Measured on the
+            // 4k route trace: prior 100 = 72.3% true hit, prior 0 = 82.7%, same slots, same policy.
+            const char* pr = std::getenv("STRATA_DSV4_EVICT_PRIOR");
+            const double prior = pr != nullptr ? std::atof(pr) : 0.0;
             m.heat.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
             const double R = (double) ranked.size();
             for (size_t r = 0; r < ranked.size(); ++r)
                 m.heat[(size_t) (ranked[r].first * g.n_expert + ranked[r].second)] =
-                    (float) (100.0 * (R - (double) r) / R);
+                    (float) (prior * (R - (double) r) / R);
             std::fprintf(stderr,
-                         "strata-dsv4: expert profile %s: prefilled %lld + %lld slots in %.1f s, heat seeded\n",
+                         "strata-dsv4: expert profile %s: prefilled %lld + %lld slots in %.1f s, heat "
+                         "seeded (prior %.0f), eviction scope %s\n",
                          prof.c_str(), (long long) filled[0], (long long) filled[1],
-                         ms_since(pf0) / 1000.0);
+                         ms_since(pf0) / 1000.0, prior, evict_global ? "global" : "layer");
         }
     }
     std::fprintf(stderr, "strata-dsv4: load complete in %.1f s\n", ms_since(t0) / 1000.0);
