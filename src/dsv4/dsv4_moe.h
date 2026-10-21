@@ -78,6 +78,11 @@ void dsv4_moe_ws_set_heat(Dsv4MoeWs* ws, const float* heat, int64_t n);
 int64_t dsv4_moe_ws_evictions(const Dsv4MoeWs* ws);
 /// [S7b] zero the STRATA_DSV4_TIME accumulators (decode-only splits: reset after the prefill pass).
 void dsv4_moe_ws_reset_timing(Dsv4MoeWs* ws);
+/// [S7a-2b] the predictive warm window, issued at the LAYER HEAD of `layer` (the engine calls this
+/// before the layer's attention half): the previous pass's routing for the pf_depth layers just ahead
+/// goes to the file tier's I/O workers, so their preads overlap the attention GPU wait instead of only
+/// the MoE staging after the route sync.  Pure I/O scheduling - no numeric effect either way.
+void dsv4_moe_prefetch_ahead(Dsv4MoeWs* ws, strata::core::FileExpertSource& experts, int64_t layer);
 
 /// The MoE half of `layer`: h is the [s][4][n_embd] HC state, updated in place (hc_post); d_tokens the
 /// [s] prompt ids (the hash layers' tid2eid lookup).  false + err on a hard failure.

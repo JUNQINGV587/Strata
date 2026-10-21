@@ -1229,6 +1229,13 @@ bool forward_tail(const Options& o, Model& m, std::string& err) {
                 std::this_thread::sleep_for(std::chrono::microseconds(hs_us));
         }
         const auto lt0 = Clock::now();  // [S7d diag] per-layer wall split
+        // ---- [S7a-2b] predictive read-ahead at the LAYER HEAD: the previous pass's routing for the
+        // two layers just ahead goes to the file tier's I/O workers here, before this layer's own
+        // attention work is enqueued, so those whole-blob preads overlap the ~43 ms/layer attention GPU
+        // wait instead of only the MoE staging behind the route sync.  Pure I/O scheduling: it only
+        // enqueues preads on the source's threads (the demand path is untouched), and a wrong
+        // prediction just wastes readahead - the numbers are identical either way.
+        strata::dsv4::dsv4_moe_prefetch_ahead(moe_ws, m.experts, layer);
         int64_t cls_ratio = -1;
         bool cls_idx = false;
         {

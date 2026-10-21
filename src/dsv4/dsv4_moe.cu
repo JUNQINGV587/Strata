@@ -1170,6 +1170,37 @@ void dsv4_moe_ws_reset_timing(Dsv4MoeWs* ws) {
     ws->moe_calls = 0;
 }
 
+// [S7a-2b] The predictive warm window, issued at the LAYER HEAD: the previous pass's routing for the
+// `pf_depth` layers just ahead goes to the file tier's I/O workers BEFORE this layer's attention runs,
+// so their whole-blob preads overlap the attention GPU wait (measured 43.3 ms/layer on 4k) instead of
+// only the MoE staging that follows the route sync.  `prefetch` only enqueues preads on the source's
+// worker threads and the demand path is untouched, so this is pure I/O scheduling: no numeric effect,
+// and a wrong prediction just wastes readahead.  The engine calls this once per layer, before the
+// attention half; the routing itself is recorded at the end of that layer's MoE half.
+void dsv4_moe_prefetch_ahead(Dsv4MoeWs* ws, strata::core::FileExpertSource& experts, int64_t layer) {
+    if (!ws || ws->cpu_pool) return;                    // the CPU-pool path reads the blobs itself
+    if (ws->n_layers <= 0 || layer < 0 || layer >= ws->n_layers) return;
+    if ((int64_t) ws->h_prev_route.size() < ws->n_layers) return;   // first pass: nothing predicted yet
+    for (int64_t d = 1; d <= ws->pf_depth; ++d) {
+        const int64_t pl = (layer + d) % ws->n_layers;
+        const std::vector<int64_t>& pr = ws->h_prev_route[(size_t) pl];
+        if (pr.empty()) continue;
+        if (ws->cache[0] != nullptr) {
+            // a pair the VRAM tier already serves needs no page-cache warm: skip it, so the workers'
+            // preads do not evict pages the demand path will actually want
+            thread_local std::vector<int64_t> miss;
+            miss.clear();
+            for (const int64_t e : pr) {
+                strata::core::ExpertCache* C = ws->cache[ws->cache[1] != nullptr ? (e & 1) : 0];
+                if (C->slot_of(pl, e) < 0) miss.push_back(e);
+            }
+            if (!miss.empty()) experts.prefetch(pl, miss.data(), (int64_t) miss.size());
+        } else {
+            experts.prefetch(pl, pr.data(), (int64_t) pr.size());
+        }
+    }
+}
+
 // [S9c] ring bookkeeping: a slot a DMA was queued out of returns to the pool once that copy has
 // finished (same-stream event, so there is no cross-stream consumer to order against).
 static void dsv4_cp_release(Dsv4MoeWs* ws) {
@@ -2011,35 +2042,15 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
         CKM(cudaMemcpyAsync(ws->bout, ws->h_bout.data(), (size_t) (s * n) * 4, cudaMemcpyHostToDevice,
                             stream));
     } else {
-        // ---- [S7a-2] predictive warm: record this pass's routing (the last row seeds the next pass),
-        // and hand the layers just ahead - as routed on the PREVIOUS pass - to the file tier's I/O
-        // workers: their whole-blob preads fill the page cache while this layer's attention/MoE
-        // computes, so the demand copies below (and at the next layers) find warm pages.  A wrong
-        // prediction only wastes readahead; the demand path is unchanged, so the output is unchanged.
+        // ---- [S7a-2] predictive warm: record this pass's routing (the last row seeds the next pass).
+        // The preads it feeds for the layers just ahead are issued at the LAYER HEAD of this layer
+        // (dsv4_moe_prefetch_ahead, called by the engine before the attention half), so they overlap the
+        // attention GPU wait instead of only the MoE staging that follows this route sync.
         if (ws->n_layers > 0) {
             if ((int64_t) ws->h_prev_route.size() < ws->n_layers)
                 ws->h_prev_route.resize((size_t) ws->n_layers);
             std::vector<int64_t>& hist = ws->h_prev_route[(size_t) layer];
             hist.assign(ws->h_idx.end() - nk, ws->h_idx.end());   // the last row's routing
-            for (int64_t d = 1; d <= ws->pf_depth; ++d) {
-                const int64_t pl = (layer + d) % ws->n_layers;
-                const std::vector<int64_t>& pr = ws->h_prev_route[(size_t) pl];
-                if (pr.empty()) continue;
-                if (ws->cache[0] != nullptr) {
-                    // a pair the VRAM tier already serves needs no page-cache warm: skip it, so the
-                    // workers' preads do not evict pages the demand path will actually want
-                    thread_local std::vector<int64_t> miss;
-                    miss.clear();
-                    for (const int64_t e : pr) {
-                        strata::core::ExpertCache* C =
-                            ws->cache[ws->cache[1] != nullptr ? (e & 1) : 0];
-                        if (C->slot_of(pl, e) < 0) miss.push_back(e);
-                    }
-                    if (!miss.empty()) experts.prefetch(pl, miss.data(), (int64_t) miss.size());
-                } else {
-                    experts.prefetch(pl, pr.data(), (int64_t) pr.size());
-                }
-            }
         }
         // ---- the GPU path [S7a]: the layer's unique experts grouped (sorted by id, the reference's
         // accumulation order) and staged a chunk at a time; each chunk is ONE grouped launch per role
