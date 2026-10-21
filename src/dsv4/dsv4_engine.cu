@@ -964,8 +964,20 @@ bool forward_tail(const Options& o, Model& m, std::string& err) {
     // --dsv4-verify-rows, each benchmark pass is --dsv4-mrow-bench.  The per-pass device buffers and
     // workspaces are sized for the WIDEST pass, not for the prompt - a short prompt with a large R used
     // to size them for s rows and run_pass then wrote s_cur = R rows into them (device OOB).
-    const int64_t s_ws = std::max<int64_t>(s, std::max<int64_t>(std::max<int64_t>(0, o.verify_rows),
-                                                               std::max<int64_t>(0, o.mrow_bench)));
+    // [chunk] a chunked prefill never runs a pass wider than its chunk (nor the ring), so the widest
+    // pass is the chunk, not the prompt: sizing for the prompt would allocate s x V logits and an
+    // s-row workspace, which a 4k+ prompt cannot fit next to the expert cache.
+    int64_t chunk_w = o.prefill_chunk;
+    if (chunk_w > 0 && chunk_w > g.sliding_window) {
+        std::fprintf(stderr,
+                     "strata-dsv4: --dsv4-prefill-chunk %lld exceeds the sliding window %lld (a pass "
+                     "wider than the ring has no defined ring shift); using %lld\n",
+                     (long long) chunk_w, (long long) g.sliding_window, (long long) g.sliding_window);
+        chunk_w = g.sliding_window;
+    }
+    const int64_t s_ws = std::max<int64_t>(chunk_w > 0 ? chunk_w : s,
+                                           std::max<int64_t>(std::max<int64_t>(0, o.verify_rows),
+                                                             std::max<int64_t>(0, o.mrow_bench)));
     s_all = std::max(s_all, s_ws);
     std::fprintf(stderr, "strata-dsv4: S5 forward: prefill pass %s, %lld tokens (13-token golden "
                          "prompt%s), embed -> %lld layers (hash / r=128 / r=4 indexer attention and MoE "
@@ -1380,14 +1392,6 @@ bool forward_tail(const Options& o, Model& m, std::string& err) {
     // dumps, so a chunked run's dump tree is the single pass's tail rows (the gate compares them).
     // The pass that starts at start_pos == 0 is a prefill-mode pass (bulk pooling); the continuations
     // go through the decode contract (per-row ring writes, block-completion pooling).
-    int64_t chunk_w = o.prefill_chunk;
-    if (chunk_w > 0 && chunk_w > g.sliding_window) {
-        std::fprintf(stderr,
-                     "strata-dsv4: --dsv4-prefill-chunk %lld exceeds the sliding window %lld (a pass "
-                     "wider than the ring has no defined ring shift); using %lld\n",
-                     (long long) chunk_w, (long long) g.sliding_window, (long long) g.sliding_window);
-        chunk_w = g.sliding_window;
-    }
     const int64_t n_chunks = chunk_w > 0 ? (s + chunk_w - 1) / chunk_w : 1;
     int64_t cur = 0;
     if (n_chunks <= 1) {
