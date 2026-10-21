@@ -72,6 +72,8 @@ void dsv4_attn_workspace_free(Dsv4AttnWorkspace& ws);
 // Writes s rows of K = min(s, win) (prefill) or win (decode) indices into topk (row-major,
 // -1 = masked); returns K.  topk must hold s*win entries.
 int dsv4_window_topk(int win, int s, int64_t start_pos, int32_t* topk);
+// [chunk] window-only list padded to `win` entries (prefill rows, start_pos 0)
+int dsv4_window_topk_pad(int win, int s, int32_t* topk);
 
 // One dense MLA attention block: x [s][4096] (attention input, already hc_pre + rmsnormed) ->
 // out [s][4096] (block output, pre-hc_post).  kv_cache is the layer's sliding-window latent cache

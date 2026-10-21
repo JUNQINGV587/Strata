@@ -1020,6 +1020,20 @@ int dsv4_window_topk(int win, int s, int64_t start_pos, int32_t* topk) {
     return k;
 }
 
+// [chunk] Same table as the start_pos == 0 branch of dsv4_window_topk, but always `win` entries per
+// row.  A prefilling pass narrower than the window would otherwise lay its compressed section out at
+// column `s` instead of `win`, which moves the compressed terms into different softmax denominator
+// lanes and changes the rounding of a row whose values are otherwise identical.  The -1 padding is
+// inert: exp(-inf) is 0 and the value loop skips e <= 0.
+int dsv4_window_topk_pad(int win, int s, int32_t* topk) {
+    for (int j = 0; j < s; ++j)
+        for (int i = 0; i < win; ++i) {
+            const int64_t v = std::max<int64_t>(j - win + 1, 0) + i;
+            topk[(size_t)j * win + i] = (int32_t)(v > j ? -1 : v);
+        }
+    return win;
+}
+
 bool dsv4_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
                        Dsv4AttnWorkspace& ws, const float* x, float* out, float* kv_cache,
                        int s, int64_t start_pos, int sliding_window, cudaStream_t stream) {

@@ -37,9 +37,18 @@ struct Dsv4CompWeights {
 
 // The compressor's pooling carry state (dsv4ref CompState): [coff*ratio][W] each, kv_state zeros /
 // score_state -inf at init.  Device-resident; one per compress layer, alive across prefill->decode.
+//
+// raw_state is the pre-ape score mirror and exists for chunked prefill only (dsv4_comp_forward's
+// chunk_prefill): when a pass boundary splits a ratio block, the block's pooling must still run in
+// the reference's prefill order, which adds ape in double before the softmax, while the decode path
+// adds ape in fp32 to the stored score and divides at the very end.  Carrying the un-added score lets
+// the continuation pool the spanning block exactly as the single pass would have.  It is allocated
+// with the other two (a few MB over the whole model) but written and read only under chunk_prefill,
+// so the single-pass and decode paths never touch it.
 struct Dsv4CompState {
     float* kv_state = nullptr;
     float* score_state = nullptr;
+    float* raw_state = nullptr;
     int64_t ratio = 0, d = 0, coff = 0;
 };
 
@@ -76,9 +85,13 @@ void dsv4_comp_workspace_free(Dsv4CompWorkspace& ws);
 // [s][n_embd] (already hc_pre'd + rmsnormed).  Compressed tokens are rmsnorm(norm)+rope(pos=j*ratio,
 // the YaRN compress table) written into out_cache slot j (prefill) / start_pos/ratio (decode); kv_out
 // receives the [ncomp][d] rows when non-null.  Returns ncomp (host-deterministic, no sync).
+// chunk_prefill marks a pass that continues a chunked prefill (start_pos > 0 and the pass boundary
+// split a ratio block): pooling that spanning block keeps the prefill arithmetic through st.raw_state
+// instead of the decode path's fp32 ape add plus trailing divide.  false = the unchanged path.
 int64_t dsv4_comp_forward(const Dsv4CompWeights& w, Dsv4CompState& st, Dsv4CompWorkspace& ws,
                           const float* x, int64_t s, int64_t start_pos, const Dsv4RopeTables& rope,
-                          double eps, float* out_cache, float* kv_out, cudaStream_t stream);
+                          double eps, float* out_cache, float* kv_out, cudaStream_t stream,
+                          bool chunk_prefill = false);
 
 // Host-side compressed-slot topk (dsv4ref compress_topk :875): prefill row j gets slots t + offset for
 // t < (j+1)/ratio (-1 past the causal bound); decode gets slots offset..offset+(start_pos+1)/ratio-1.
@@ -95,7 +108,7 @@ bool dsv4_comp_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope
                             Dsv4AttnWorkspace& aws, const Dsv4CompWeights& cw, Dsv4CompState& cst,
                             Dsv4CompWorkspace& cws, const float* x, float* out, float* kv_cache,
                             int64_t ratio, int64_t s, int64_t start_pos, int64_t sliding_window,
-                            cudaStream_t stream);
+                            cudaStream_t stream, bool chunk_prefill = false);
 
 // =========================================================================================== [S5] indexer
 
@@ -144,7 +157,7 @@ bool dsv4_idx_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
                            const Dsv4IndexerWeights& iw, Dsv4CompState& ist, float* idx_cache,
                            Dsv4CompWorkspace& cws, Dsv4IndexerWorkspace& iws, const float* x, float* out,
                            float* kv_cache, int64_t s, int64_t start_pos, int64_t sliding_window,
-                           cudaStream_t stream);
+                           cudaStream_t stream, bool chunk_prefill = false);
 
 // The per-layer attention-half weights the engine gathers: block norm + hc_pre/hc_post parameters,
 // then the S3 attention tensors, (compress layers) the compressor tensors, and (r=4 layers) the indexer.
@@ -170,6 +183,6 @@ bool dsv4_attn_half(const Dsv4Geometry& g, int64_t layer, const Dsv4AttnHalfWeig
                     float* d_h, float* kv_cache, Dsv4CompState* comp_state, Dsv4CompState* idx_state,
                     float* idx_cache, Dsv4AttnWorkspace& aws, Dsv4CompWorkspace& cws,
                     Dsv4IndexerWorkspace& iws, int64_t s, int64_t start_pos, cudaStream_t stream,
-                    std::string& err);
+                    std::string& err, bool chunk_prefill = false);
 
 }  // namespace strata::dsv4

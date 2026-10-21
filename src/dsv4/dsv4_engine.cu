@@ -1213,7 +1213,7 @@ bool forward_tail(const Options& o, Model& m, std::string& err) {
                                               ratio > 0 ? &comp_states[(size_t) layer] : nullptr,
                                               has_idx ? &idx_states[(size_t) layer] : nullptr,
                                               idx_ptr[(size_t) layer], attn_ws, comp_ws, idx_ws, s_cur,
-                                              start_pos, stream, err))
+                                              start_pos, stream, err, chunk))
                 return -1;
             if (ea0 != nullptr && ea1 != nullptr) CK(cudaEventRecord(ea1, stream));
             if (eton) etm_attn += ms_since(ta0);

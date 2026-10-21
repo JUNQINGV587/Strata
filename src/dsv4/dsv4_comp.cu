@@ -213,6 +213,44 @@ __global__ void dsv4_comp_pool_decode_kernel(const float* __restrict__ kv_state,
 }
 
 // ---------------------------------------------------------------------------
+// Chunked-prefill pooling over the carry state: a pass boundary split the ratio block, so this is the
+// prefill arithmetic (dsv4_comp_pool_kernel: v = double(score) + double(ape), p = exp(v-mx)/denom,
+// acc += p*kv) applied to the state rows instead of the decode order (fp32 ape add, trailing divide).
+// Row mapping is the carry state's, not the prefill buffer's: for overlap, rows [0, ratio) are the
+// previous block (dims 0..d) and rows [ratio, 2*ratio) the current block (dims d..2d); row i belongs
+// to ape row i % ratio either way, because block starts are multiples of ratio.
+// ---------------------------------------------------------------------------
+__global__ void dsv4_comp_pool_chunk_kernel(const float* __restrict__ kv_state,
+                                            const float* __restrict__ raw_state,
+                                            const float* __restrict__ ape, int64_t d, int64_t ratio,
+                                            int coff, float* __restrict__ kv_c) {
+    const int64_t dd = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (dd >= d) return;
+    const int64_t W = coff * d;
+    const int64_t rows = coff * ratio;
+    const bool overlap = coff == 2;
+    auto v_of = [&](int64_t i) {
+        const int64_t off = (!overlap || i < ratio) ? dd : d + dd;
+        return (double) raw_state[(size_t) (i * W + off)] +
+               (double) ape[(size_t) ((i % ratio) * W + off)];
+    };
+    double mx = -1.0 / 0.0;
+    for (int64_t i = 0; i < rows; ++i) {
+        const double v = v_of(i);
+        if (v > mx) mx = v;
+    }
+    double denom = 0.0;
+    for (int64_t i = 0; i < rows; ++i) denom += exp(v_of(i) - mx);
+    double acc = 0.0;
+    for (int64_t i = 0; i < rows; ++i) {   // the prefill order: divide first, then multiply
+        const int64_t off = (!overlap || i < ratio) ? dd : d + dd;
+        const double p = exp(v_of(i) - mx) / denom;
+        acc += p * (double) kv_state[(size_t) (i * W + off)];
+    }
+    kv_c[(size_t) dd] = (float) acc;
+}
+
+// ---------------------------------------------------------------------------
 // Decode: score[0][c] += ape[rem*W + c] before the state store (dsv4ref :735-736).
 // ---------------------------------------------------------------------------
 __global__ void dsv4_comp_ape_add_row_kernel(float* __restrict__ score,
@@ -354,7 +392,8 @@ bool dsv4_comp_state_init(Dsv4CompState& st, int64_t ratio, int64_t d, int64_t c
     st.coff = coff;
     const int64_t n = coff * ratio * coff * d;   // [coff*ratio][coff*d]
     if (cudaMalloc(&st.kv_state, (size_t) n * 4) != cudaSuccess ||
-        cudaMalloc(&st.score_state, (size_t) n * 4) != cudaSuccess) {
+        cudaMalloc(&st.score_state, (size_t) n * 4) != cudaSuccess ||
+        cudaMalloc(&st.raw_state, (size_t) n * 4) != cudaSuccess) {
         std::fprintf(stderr, "dsv4_comp: state allocation failed\n");
         dsv4_comp_state_free(st);
         return false;
@@ -362,6 +401,9 @@ bool dsv4_comp_state_init(Dsv4CompState& st, int64_t ratio, int64_t d, int64_t c
     const int64_t threads = 256, blocks = (n + threads - 1) / threads;
     dsv4_comp_init_kernel<<<(unsigned) blocks, (unsigned) threads, 0, stream>>>(st.kv_state,
                                                                                 st.score_state, n);
+    // raw_state (the chunked-prefill pre-ape mirror) is zeroed, not -inf: it is written before it is
+    // ever read (a chunk pass stores every row it pools), so this only keeps a stray read finite.
+    DSV4_CK(cudaMemsetAsync(st.raw_state, 0, (size_t) n * 4, stream));
     DSV4_CK(cudaGetLastError());
     return true;
 }
@@ -369,6 +411,7 @@ bool dsv4_comp_state_init(Dsv4CompState& st, int64_t ratio, int64_t d, int64_t c
 void dsv4_comp_state_free(Dsv4CompState& st) {
     cudaFree(st.kv_state);
     cudaFree(st.score_state);
+    cudaFree(st.raw_state);
     st = Dsv4CompState{};
 }
 
@@ -425,7 +468,8 @@ void dsv4_comp_workspace_free(Dsv4CompWorkspace& ws) {
 
 int64_t dsv4_comp_forward(const Dsv4CompWeights& w, Dsv4CompState& st, Dsv4CompWorkspace& ws,
                           const float* x, int64_t s, int64_t start_pos, const Dsv4RopeTables& rope,
-                          double eps, float* out_cache, float* kv_out, cudaStream_t stream) {
+                          double eps, float* out_cache, float* kv_out, cudaStream_t stream,
+                          bool chunk_prefill) {
     const int64_t ratio = st.ratio, d = st.d, coff = st.coff, W = coff * d;
     const bool overlap = coff == 2;
     if (s > ws.max_s || W > ws.W) {
@@ -454,6 +498,11 @@ int64_t dsv4_comp_forward(const Dsv4CompWeights& w, Dsv4CompState& st, Dsv4CompW
             dsv4_comp_ape_store_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>(
                 st.score_state, ws.score + (size_t) (cutoff - ratio) * W, w.ape, n);
             DSV4_CK(cudaGetLastError());
+            // [chunk] a continuation pass pools this half through raw_state (prefill order, ape in
+            // double), so keep the un-added score next to the added one
+            if (chunk_prefill)
+                DSV4_CK(cudaMemcpyAsync(st.raw_state, ws.score + (size_t) (cutoff - ratio) * W,
+                                        (size_t) (ratio * W) * 4, cudaMemcpyDeviceToDevice, stream));
         }
         if (rem > 0) {
             DSV4_CK(cudaMemcpyAsync(st.kv_state + (size_t) offset * W, ws.kv + (size_t) cutoff * W,
@@ -462,6 +511,10 @@ int64_t dsv4_comp_forward(const Dsv4CompWeights& w, Dsv4CompState& st, Dsv4CompW
             dsv4_comp_ape_store_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>(
                 st.score_state + (size_t) offset * W, ws.score + (size_t) cutoff * W, w.ape, n);
             DSV4_CK(cudaGetLastError());
+            if (chunk_prefill)
+                DSV4_CK(cudaMemcpyAsync(st.raw_state + (size_t) offset * W,
+                                        ws.score + (size_t) cutoff * W, (size_t) (rem * W) * 4,
+                                        cudaMemcpyDeviceToDevice, stream));
         }
         if (!should) return 0;
         ncomp = cutoff / ratio;
@@ -480,18 +533,32 @@ int64_t dsv4_comp_forward(const Dsv4CompWeights& w, Dsv4CompState& st, Dsv4CompW
             const int64_t pos = start_pos + j;
             const bool should = (pos + 1) % ratio == 0;
             const int64_t rem = pos % ratio;
-            dsv4_comp_ape_add_row_kernel<<<(unsigned) ((W + 255) / 256), 256, 0, stream>>>(
-                ws.score + (size_t) j * W, w.ape + (size_t) rem * W, W);
-            DSV4_CK(cudaGetLastError());
             const int64_t dst_row = overlap ? ratio + rem : rem;
+            if (chunk_prefill) {
+                // [chunk] keep the score un-added; the spanning block's pool re-applies ape in double
+                DSV4_CK(cudaMemcpyAsync(st.raw_state + (size_t) dst_row * W, ws.score + (size_t) j * W,
+                                        (size_t) W * 4, cudaMemcpyDeviceToDevice, stream));
+            } else {
+                dsv4_comp_ape_add_row_kernel<<<(unsigned) ((W + 255) / 256), 256, 0, stream>>>(
+                    ws.score + (size_t) j * W, w.ape + (size_t) rem * W, W);
+                DSV4_CK(cudaGetLastError());
+            }
             DSV4_CK(cudaMemcpyAsync(st.kv_state + (size_t) dst_row * W, ws.kv + (size_t) j * W,
                                     (size_t) W * 4, cudaMemcpyDeviceToDevice, stream));
-            DSV4_CK(cudaMemcpyAsync(st.score_state + (size_t) dst_row * W,
-                                    ws.score + (size_t) j * W, (size_t) W * 4,
-                                    cudaMemcpyDeviceToDevice, stream));
+            if (!chunk_prefill)
+                DSV4_CK(cudaMemcpyAsync(st.score_state + (size_t) dst_row * W,
+                                        ws.score + (size_t) j * W, (size_t) W * 4,
+                                        cudaMemcpyDeviceToDevice, stream));
             if (!should) continue;
-            dsv4_comp_pool_decode_kernel<<<(unsigned) ((d + 255) / 256), 256, 0, stream>>>(
-                st.kv_state, st.score_state, d, ratio, (int) coff, ws.kv_c + (size_t) emit_pos.size() * d);
+            if (chunk_prefill) {
+                dsv4_comp_pool_chunk_kernel<<<(unsigned) ((d + 255) / 256), 256, 0, stream>>>(
+                    st.kv_state, st.raw_state, w.ape, d, ratio, (int) coff,
+                    ws.kv_c + (size_t) emit_pos.size() * d);
+            } else {
+                dsv4_comp_pool_decode_kernel<<<(unsigned) ((d + 255) / 256), 256, 0, stream>>>(
+                    st.kv_state, st.score_state, d, ratio, (int) coff,
+                    ws.kv_c + (size_t) emit_pos.size() * d);
+            }
             DSV4_CK(cudaGetLastError());
             if (overlap) {
                 // memmove(state, state + ratio*W, ratio*W) via staging (same-buffer D2D overlap is UB)
@@ -500,9 +567,11 @@ int64_t dsv4_comp_forward(const Dsv4CompWeights& w, Dsv4CompState& st, Dsv4CompW
                                         cudaMemcpyDeviceToDevice, stream));
                 DSV4_CK(cudaMemcpyAsync(st.kv_state, ws.shift, bytes, cudaMemcpyDeviceToDevice,
                                         stream));
-                DSV4_CK(cudaMemcpyAsync(ws.shift, st.score_state + (size_t) ratio * W, bytes,
+                // [chunk] the continuation reads raw_state, so that is the half that has to move
+                float* src_half = chunk_prefill ? st.raw_state : st.score_state;
+                DSV4_CK(cudaMemcpyAsync(ws.shift, src_half + (size_t) ratio * W, bytes,
                                         cudaMemcpyDeviceToDevice, stream));
-                DSV4_CK(cudaMemcpyAsync(st.score_state, ws.shift, bytes, cudaMemcpyDeviceToDevice,
+                DSV4_CK(cudaMemcpyAsync(src_half, ws.shift, bytes, cudaMemcpyDeviceToDevice,
                                         stream));
             }
             emit_pos.push_back(pos + 1 - ratio);
@@ -806,7 +875,7 @@ bool dsv4_idx_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
                            const Dsv4IndexerWeights& iw, Dsv4CompState& ist, float* idx_cache,
                            Dsv4CompWorkspace& cws, Dsv4IndexerWorkspace& iws, const float* x, float* out,
                            float* kv_cache, int64_t s, int64_t start_pos, int64_t sliding_window,
-                           cudaStream_t stream) {
+                           cudaStream_t stream, bool chunk_prefill) {
     constexpr int kQRank = 1024, kORows = 8192, kOGroup = 1024;
     constexpr int kIdxHeads = 64, kIdxDim = 128;
     const int win = (int) sliding_window;
@@ -867,7 +936,7 @@ bool dsv4_idx_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
     // write time; decode slot start_pos/ratio)
     const int64_t ncomp =
         dsv4_comp_forward(cw, cst, cws, x, s, start_pos, rope, kRmsEps,
-                          kv_cache + (size_t) win * kHeadDim, nullptr, stream);
+                          kv_cache + (size_t) win * kHeadDim, nullptr, stream, chunk_prefill);
     // kv source + compressed-section offset (s prefill / win decode, dsv4ref :997)
     const float* kv_ptr = nullptr;
     int64_t offset = 0;
@@ -897,7 +966,8 @@ bool dsv4_idx_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
     dsv4_rope_rows_mul(iws.q, (int) s * kIdxHeads, kIdxDim, rope.half, kIdxHeads, 1, rope, start_pos, 0,
                        stream);
     // indexer compressor: fp32 keys into the layer's indexer cache slice (own ratio-4/d-128/coff-2 state)
-    dsv4_comp_forward(iw.comp, ist, cws, x, s, start_pos, rope, kRmsEps, idx_cache, nullptr, stream);
+    dsv4_comp_forward(iw.comp, ist, cws, x, s, start_pos, rope, kRmsEps, idx_cache, nullptr, stream,
+                      chunk_prefill);
     // weights: gemm(indexer.proj, raw BF16, double accumulation); the 128^-0.5 * 64^-0.5 scale is applied
     // on the host below, in dsv4ref's :919-921 order
     dsv4_gemm_bf16_kernel<<<kIdxHeads, 128, 0, stream>>>(iw.proj, kIdxHeads, kNEmbd, x, (int) s,
@@ -907,9 +977,14 @@ bool dsv4_idx_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
     // trip and no stream sync.  The key order reproduces the host's stable descending sort (ties asc t)
     // and the score kernels are __fmul_rn/__fadd_rn ports of dsv4_idx_dot / the ascending-h sum.
     const int64_t nc = (start_pos + s) / 4;
-    const int64_t kw_cap = start_pos > 0 ? win : std::min<int64_t>(s, win);
+    // [chunk] a narrow prefill pass pads its window list to `win` entries so the compressed section
+    // starts at the same column a full-width pass uses (the softmax denominator then groups the same
+    // terms and the pass is bit-identical to the wide pass's first s rows).
+    const bool pad_kw = chunk_prefill && start_pos == 0 && s < win;
+    const int64_t kw_cap = pad_kw ? win : (start_pos > 0 ? win : std::min<int64_t>(s, win));
     std::vector<int32_t> h_topk((size_t) (s * kw_cap), -1);
-    const int64_t kw = dsv4_window_topk(win, (int) s, start_pos, h_topk.data());
+    const int64_t kw = pad_kw ? dsv4_window_topk_pad(win, (int) s, h_topk.data())
+                              : dsv4_window_topk(win, (int) s, start_pos, h_topk.data());
     int64_t kc = 0;
     if (nc > 0) {
         if (!dsv4_indexer_workspace_reserve(iws, s, nc)) {
@@ -998,7 +1073,7 @@ bool dsv4_comp_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope
                             Dsv4AttnWorkspace& aws, const Dsv4CompWeights& cw, Dsv4CompState& cst,
                             Dsv4CompWorkspace& cws, const float* x, float* out, float* kv_cache,
                             int64_t ratio, int64_t s, int64_t start_pos, int64_t sliding_window,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, bool chunk_prefill) {
     constexpr int kQRank = 1024, kORows = 8192, kOGroup = 1024;
     const int win = (int) sliding_window;
     // [R-02/R-04] input bounds, checked here as well as at run_pass (see dsv4_attn_forward).
@@ -1057,7 +1132,7 @@ bool dsv4_comp_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope
     // compressor: compressed slots live behind the window region
     const int64_t ncomp =
         dsv4_comp_forward(cw, cst, cws, x, s, start_pos, rope, kRmsEps,
-                          kv_cache + (size_t) win * kHeadDim, cws.kv_c, stream);
+                          kv_cache + (size_t) win * kHeadDim, cws.kv_c, stream, chunk_prefill);
     // kv source + topk (host-built, then uploaded)
     const float* kv_ptr = nullptr;
     int64_t offset = 0;
@@ -1080,12 +1155,16 @@ bool dsv4_comp_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope
     // [R8] readable KV rows: prefill sees s rows (kv_new or the staged kv_all) plus the compressed
     // section, decode sees the window plus the compressed slots behind it
     const int64_t kv_slots = start_pos == 0 ? (ncomp > 0 ? s + ncomp : s) : (int64_t) win;
-    const int64_t kw_cap = start_pos > 0 ? win : std::min<int64_t>(s, win);
+    // [chunk] see the r=4 path: pad the window list so a narrow prefill pass keeps the full-width
+    // column layout of the compressed section.
+    const bool pad_kw = chunk_prefill && start_pos == 0 && s < win;
+    const int64_t kw_cap = pad_kw ? win : (start_pos > 0 ? win : std::min<int64_t>(s, win));
     // [G1] the compress block's row stride is the LARGEST row count in the batch ((start_pos+s)/ratio);
     // for s == 1 this is the old (start_pos+1)/ratio.
     const int64_t kc_cap = (start_pos + s) / ratio;
     std::vector<int32_t> h_topk((size_t) (s * (kw_cap + kc_cap)));
-    const int64_t kw = dsv4_window_topk(win, (int) s, start_pos, h_topk.data());
+    const int64_t kw = pad_kw ? dsv4_window_topk_pad(win, (int) s, h_topk.data())
+                              : dsv4_window_topk(win, (int) s, start_pos, h_topk.data());
     const int64_t kc =
         dsv4_compress_topk(ratio, s, start_pos, offset, h_topk.data() + (size_t) s * kw_cap);
     // fold the two row blocks into dense [s][kw+kc] rows
@@ -1127,6 +1206,7 @@ bool dsv4_comp_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope
     dsv4_gemm_q8_rows(w.wo_a, kORows, kNEmbd, kOGroup, aws.attn_t, (int) s, kNHead * kHeadDim,
                       aws.o8k, stream, 1);
     dsv4_gemm_q8_rows(w.wo_b, kNEmbd, kORows, 0, aws.o8k, (int) s, kORows, out, stream);
+    // compared token by token (filename carries the pass ordinal: p0 = start_pos 0, p1 = later).
     return true;
 }
 
@@ -1137,7 +1217,7 @@ bool dsv4_attn_half(const Dsv4Geometry& g, int64_t layer, const Dsv4AttnHalfWeig
                     float* d_h, float* kv_cache, Dsv4CompState* comp_state,
                     Dsv4CompState* idx_state, float* idx_cache, Dsv4AttnWorkspace& aws,
                     Dsv4CompWorkspace& cws, Dsv4IndexerWorkspace& iws, int64_t s, int64_t start_pos,
-                    cudaStream_t stream, std::string& err) {
+                    cudaStream_t stream, std::string& err, bool chunk_prefill) {
     const int64_t N = g.n_embd;
     const int64_t ratio = dsv4_compress_ratio(layer);
     if (s > cws.max_s || s > iws.max_s) {
@@ -1166,7 +1246,8 @@ bool dsv4_attn_half(const Dsv4Geometry& g, int64_t layer, const Dsv4AttnHalfWeig
     } else if (ratio == 128) {
         // r=128 layers: compressor + MLA over the window + compressed KV, YaRN rope (theta 160000)
         if (!dsv4_comp_attn_forward(w.attn, rope_yarn, aws, w.comp, *comp_state, cws, cws.y, cws.bout,
-                                    kv_cache, ratio, s, start_pos, g.sliding_window, stream)) {
+                                    kv_cache, ratio, s, start_pos, g.sliding_window, stream,
+                                    chunk_prefill)) {
             err = "dsv4_attn_half: compressed attention rejected the pass (see the message above)";
             return false;
         }
@@ -1177,7 +1258,7 @@ bool dsv4_attn_half(const Dsv4Geometry& g, int64_t layer, const Dsv4AttnHalfWeig
         // ratio>0 layer, L02 included, so this path uses rope_yarn (theta 160000).
         if (!dsv4_idx_attn_forward(w.attn, rope_yarn, aws, w.comp, *comp_state, w.idx, *idx_state,
                                    idx_cache, cws, iws, cws.y, cws.bout, kv_cache, s, start_pos,
-                                   g.sliding_window, stream)) {
+                                   g.sliding_window, stream, chunk_prefill)) {
             err = "dsv4_attn_half: indexer attention rejected the pass (see the message above)";
             return false;
         }
