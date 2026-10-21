@@ -742,6 +742,36 @@ struct Dsv4MoeWs {
     };
     ColdPipe cp;
 
+    /// [S10] PREFILL expert staging.  The measured shape of a 128-token pass on this box: the wall is
+    /// ~80% host-side blob movement, ~8% GEMV, ~12% everything else, and the three do not overlap at
+    /// all.  The reason is that a pageable H2D blocks the issuing thread for the whole bounce
+    /// (~2.1 ms per 13.5 MiB blob, 6.9 GB/s) and the code does one per missing expert, one after the
+    /// other, on the thread that is also building the tables.  Here the layer's missing blobs are read
+    /// into page-locked slots by a pool of host threads - one core copies out of the page cache at
+    /// ~4 GB/s, eight at ~22 GB/s measured - and then copied to their cache slots by DMA on a side
+    /// stream per device.  The kernel stream waits on a per-chunk event, so the copies overlap the
+    /// GEMV launches instead of stalling the host.  Same bytes to the same slots, same kernels: the
+    /// arithmetic is untouched (this is a scheduling change only).
+    struct PfWs {
+        bool on = false, init_tried = false, active = false;
+        int n_slot = 0, n_thread = 8;
+        int64_t min_s = 32;                        ///< smallest batch that prefetches (STRATA_DSV4_PF_MINS)
+        size_t bytes = 0;
+        std::vector<uint8_t*> host;            ///< pinned slots, one blob each
+        std::vector<const uint8_t*> over;      ///< per-expert pinned source for the current layer
+        cudaStream_t cs[2] = {nullptr, nullptr};   ///< copy stream per device
+        cudaEvent_t ev[2] = {nullptr, nullptr};    ///< every copy of the layer queued
+        cudaEvent_t cev[2][48] = {};               ///< per-chunk copies queued (device 0)
+        int cev_n = 0;
+        int64_t n_layer = 0, n_jobs = 0, seq = 0, layer = 0;   ///< `layer` = the one the readers are on
+        std::vector<int32_t> set;                  ///< this layer's read set, in groups order (the readers'
+                                                   ///< input: it must outlive dsv4_pf_layer)
+        std::atomic<int> next{0};                  ///< next read-set index to hand out
+        std::vector<int32_t> pos;                  ///< expert -> index in this layer's read set (-1: none)
+        std::vector<int> ready;                    ///< 1 once slot i holds its blob
+        std::vector<std::thread> workers;           ///< still reading this layer's set
+    };
+    PfWs pf;
 };
 
 // [S8] A/B switch for the pinned upload arenas (0 = the pre-S8 pageable staging path)
@@ -1166,6 +1196,140 @@ static bool dsv4_cp_fill(Dsv4MoeWs* ws, strata::core::ExpertCache* C,
     return true;
 }
 
+// [S10] prefill prefetch, see Dsv4MoeWs::PfWs.  Opt-out: STRATA_DSV4_PREFETCH=0.  Everything here is
+// scheduling: the bytes a fill copies, the slot it lands in and the kernel that reads it are unchanged.
+static bool dsv4_pf_init(Dsv4MoeWs* ws, int64_t blob_bytes) {
+    Dsv4MoeWs::PfWs& pf = ws->pf;
+    if (pf.init_tried) return pf.on;
+    pf.init_tried = true;
+    if (const char* e = std::getenv("STRATA_DSV4_PREFETCH"); e != nullptr && std::atoi(e) == 0) return false;
+    pf.bytes = (size_t) blob_bytes;
+    pf.n_thread = 8;
+    pf.n_slot = 96;   // 96 x 14.16 MB = 1.36 GB pinned; the worst layer needs 46.0 blobs/call
+    pf.min_s = 32;
+    if (const char* t = std::getenv("STRATA_DSV4_PF_MINS")) {
+        const int v = std::atoi(t);
+        if (v > 0 && v <= 4096) pf.min_s = v;
+    }
+    if (const char* t = std::getenv("STRATA_DSV4_PF_THREADS")) {
+        const int v = std::atoi(t);
+        if (v > 0 && v <= 16) pf.n_thread = v;
+    }
+    if (const char* t = std::getenv("STRATA_DSV4_PF_SLOTS")) {
+        const int v = std::atoi(t);
+        if (v > 0 && v <= 96) pf.n_slot = v;
+    }
+    pf.host.assign((size_t) pf.n_slot, nullptr);
+    int ok = 0;
+    for (int i = 0; i < pf.n_slot; ++i) {
+        if (cudaHostAlloc((void**) &pf.host[(size_t) i], pf.bytes, cudaHostAllocPortable) != cudaSuccess) {
+            (void) cudaGetLastError();
+            break;
+        }
+        ++ok;
+    }
+    if (ok < 4) {
+        for (int i = 0; i < ok; ++i) (void) cudaFreeHost(pf.host[(size_t) i]);
+        pf.host.clear();
+        return false;
+    }
+    pf.n_slot = ok;
+    for (int d = 0; d < 2; ++d) {
+        if (cudaStreamCreateWithFlags(&pf.cs[d], cudaStreamNonBlocking) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+        if (cudaEventCreateWithFlags(&pf.ev[d], cudaEventDisableTiming) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+        for (int c = 0; c < 48; ++c)
+            if (cudaEventCreateWithFlags(&pf.cev[d][c], cudaEventDisableTiming) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return false;
+            }
+    }
+    pf.on = true;
+    return true;
+}
+
+// Read every blob the layer will have to move into its own pinned slot, with `n_thread` readers.  The
+// readers copy the same mapping the demand path copies, so a page that is not cached yet faults in
+// exactly once and the DMA that follows reads page-locked memory instead of stalling the host.
+static void dsv4_pf_join(Dsv4MoeWs* ws);
+
+static bool dsv4_pf_layer(Dsv4MoeWs* ws, strata::core::FileExpertSource& experts, int64_t layer,
+                          const std::vector<int32_t>& groups, bool peer_on, int64_t blob_bytes) {
+    Dsv4MoeWs::PfWs& pf = ws->pf;
+    pf.active = false;
+    pf.cev_n = 0;
+    if (!dsv4_pf_init(ws, blob_bytes)) return false;
+    if (pf.bytes != (size_t) blob_bytes) return false;
+    dsv4_pf_join(ws);                              // the previous layer's readers own the pinned slots
+    if (pf.n_layer > 0) {
+        if (pf.ev[0] != nullptr) { (void) cudaEventSynchronize(pf.ev[0]); (void) cudaGetLastError(); }
+        if (ws->peer.stream != nullptr) { (void) cudaStreamSynchronize(ws->peer.stream); (void) cudaGetLastError(); }
+    }
+    if (pf.over.size() != (size_t) ws->ne) pf.over.assign((size_t) ws->ne, (const uint8_t*) nullptr);
+    std::fill(pf.over.begin(), pf.over.end(), (const uint8_t*) nullptr);
+    if (pf.pos.size() != (size_t) ws->ne) pf.pos.assign((size_t) ws->ne, -1);
+    std::fill(pf.pos.begin(), pf.pos.end(), -1);
+    // the fill sites and their predicate, in groups order (groups0 keeps that order for device 0)
+    std::vector<int32_t> miss;
+    miss.reserve(groups.size());
+    for (const int32_t g : groups) {
+        strata::core::ExpertCache* C = (peer_on && (g & 1) && ws->cache[1] != nullptr) ? ws->cache[1] : ws->cache[0];
+        if (C != nullptr && C->slot_of(layer, g) >= 0) continue;   // resident: nothing to move
+        miss.push_back(g);
+    }
+    if (!miss.empty() && peer_on) {
+        std::stable_partition(miss.begin(), miss.end(), [](int32_t g) { return (g & 1) != 0; });
+    }
+    if (miss.empty()) { pf.active = true; pf.seq = 0; return true; }
+    if ((int) miss.size() > pf.n_slot) return false;   // too wide for the pool: let the old path run
+    const int n = (int) miss.size();
+    // The readers run CONCURRENTLY with the admission loops below: each expert's slot is marked ready
+    // as soon as its blob is in pinned memory, and the fill site is the one that waits for it.  The
+    // DMA of the first chunk is therefore already in flight while the last blobs are still reading.
+    pf.ready.assign((size_t) n, 0);
+    pf.set = miss;                                  // the readers outlive this call: no stack captures
+    pf.layer = layer;
+    pf.next.store(0, std::memory_order_relaxed);
+    for (int i = 0; i < n; ++i) {
+        pf.pos[(size_t) miss[(size_t) i]] = (int32_t) i;
+        pf.over[(size_t) miss[(size_t) i]] = pf.host[(size_t) i];
+    }
+    pf.workers.clear();
+    pf.workers.reserve((size_t) pf.n_thread);
+    Dsv4MoeWs* const ws_c = ws;
+    strata::core::FileExpertSource* const ex = &experts;
+    for (int t = 0; t < pf.n_thread; ++t)
+        pf.workers.emplace_back([ws_c, ex, n, t] {
+            (void) t;
+            Dsv4MoeWs::PfWs& p = ws_c->pf;
+            for (;;) {
+                const int i = p.next.fetch_add(1, std::memory_order_relaxed);
+                if (i >= n) break;
+                const uint8_t* src = ex->blob((int64_t) p.layer, p.set[(size_t) i]);
+                if (src != nullptr) std::memcpy(p.host[(size_t) i], src, p.bytes);
+                p.ready[(size_t) i] = 1;
+            }
+        });
+    pf.active = true;
+    pf.seq = 1;
+    ++pf.n_layer;
+    pf.n_jobs += n;
+    return true;
+}
+
+// [S10] wait for one pinned slot to hold its blob (the readers run in parallel with the host).
+static inline void dsv4_pf_wait(Dsv4MoeWs* ws, int64_t e) {
+    Dsv4MoeWs::PfWs& pf = ws->pf;
+    if (pf.pos.empty() || (size_t) e >= pf.pos.size()) return;
+    const int32_t i = pf.pos[(size_t) e];
+    while (i >= 0 && !pf.ready[(size_t) i]) std::this_thread::yield();
+}
+
+// [S10] drain the layer's readers (the slots cannot be reused before every read finished).
+static void dsv4_pf_join(Dsv4MoeWs* ws) {
+    for (auto& t : ws->pf.workers) if (t.joinable()) t.join();
+    ws->pf.workers.clear();
+}
+
 // [S7b] one miss's slot: admit first-touch; when the layer's quota is full, swap the coldest
 // resident of the same layer - never one this pass routed (its slot is about to be read) - for a
 // clearly hotter new expert.  The fill is queued on `stream` either way, so the slot's bytes are
@@ -1207,6 +1371,9 @@ static int32_t dsv4_admit_heat(Dsv4MoeWs* ws, strata::core::ExpertCache* C,
     // follows it are two different costs; both land on this thread today.
     const auto ct0 = ws->time_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const uint8_t* blob = experts.blob(layer, e);
+    const bool pf_hit = ws->pf.on && ws->pf.active && !ws->pf.over.empty() &&
+                        ws->pf.over[(size_t) e] != nullptr;
+    if (pf_hit) { dsv4_pf_wait(ws, e); blob = ws->pf.over[(size_t) e]; }
     const auto ct1 = ws->time_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (!blob) {
         err = "dsv4_moe: no blob for the routed expert";
@@ -1219,8 +1386,10 @@ static int32_t dsv4_admit_heat(Dsv4MoeWs* ws, strata::core::ExpertCache* C,
         if (scratch != nullptr) std::memcpy(scratch, blob, (size_t) blob_bytes);
         return slot;
     }
+    cudaStream_t fill_stream = stream;
+    if (pf_hit && dev == 0 && ws->pf.cs[0] != nullptr) fill_stream = ws->pf.cs[0];
     if (!dsv4_ablit("STRATA_ABL_NOCOPY") &&
-        !C->fill_slot(slot, blob, stream, err, blob_bytes)) {
+        !C->fill_slot(slot, blob, (void*) fill_stream, err, blob_bytes)) {
         failed = true;
         return strata::core::kNotResident;
     }
@@ -1230,7 +1399,7 @@ static int32_t dsv4_admit_heat(Dsv4MoeWs* ws, strata::core::ExpertCache* C,
         ws->tm_cold_fill += std::chrono::duration<double, std::milli>(ct2 - ct1).count();
         ++ws->cold_n;
     }
-    experts.note_async_read(blob, stream);
+    if (!pf_hit) experts.note_async_read(blob, stream);
     return slot;
 }
 
@@ -1243,6 +1412,9 @@ void dsv4_moe_ws_report(Dsv4MoeWs* ws, const char* tag) {
                  tag, (long long) ws->moe_calls, ws->tm_pre / calls, ws->tm_sync / calls,
                  ws->tm_group / calls, ws->tm_chunks / calls, ws->tm_tail / calls,
                  (ws->tm_pre + ws->tm_sync + ws->tm_group + ws->tm_chunks + ws->tm_tail) / calls);
+    if (ws->pf.n_layer > 0)
+        std::fprintf(stderr, "dsv4_moe[%s]: prefetch: %lld layers engaged, %lld blobs read into pinned\n", tag,
+                     (long long) ws->pf.n_layer, (long long) ws->pf.n_jobs);
     if (ws->moe_calls > 0)
         std::fprintf(stderr, "dsv4_moe[%s]: group sub ms/call: bitmap+groups %.3f peer-admit+split %.3f entry-tables %.3f\n",
                      tag, ws->tm_g1 / calls, ws->tm_g2 / calls, ws->tm_g3 / calls);
@@ -1268,6 +1440,18 @@ void dsv4_moe_ws_report(Dsv4MoeWs* ws, const char* tag) {
 }
 
 void dsv4_moe_ws_free(Dsv4MoeWs* ws) {
+    if (ws != nullptr) {
+        dsv4_pf_join(ws);
+        for (uint8_t* p : ws->pf.host) if (p != nullptr) (void) cudaFreeHost(p);
+        ws->pf.host.clear();
+        for (int d = 0; d < 2; ++d) {
+            if (ws->pf.cs[d] != nullptr) { (void) cudaStreamDestroy(ws->pf.cs[d]); ws->pf.cs[d] = nullptr; }
+            if (ws->pf.ev[d] != nullptr) { (void) cudaEventDestroy(ws->pf.ev[d]); ws->pf.ev[d] = nullptr; }
+            for (int c = 0; c < 48; ++c)
+                if (ws->pf.cev[d][c] != nullptr) { (void) cudaEventDestroy(ws->pf.cev[d][c]); ws->pf.cev[d][c] = nullptr; }
+        }
+        (void) cudaGetLastError();
+    }
     if (!ws) return;
     if (ws->route_dump) {
         std::fclose(ws->route_dump);
@@ -1651,6 +1835,16 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
         const unsigned d_blocks = (unsigned) (n / (256 / (inter / 64)));         // 4096 / 8
         const uint64_t blob_bytes = (uint64_t) lay.blob_bytes(layer);
         const bool peer_on = ws->cache[0] != nullptr && ws->cache[1] != nullptr && ws->peer.active;
+        // [S10] read the layer's missing blobs into pinned slots before the admission loops, which can
+        // then queue a plain pinned H2D instead of stalling this thread on a pageable bounce
+        // The pinned read set belongs to THIS call: a decode step (s = 1) must never see the prefill's
+        // stale pinned blobs, so the flag is cleared here and only dsv4_pf_layer turns it back on.
+        // Prefill-sized batches only: a multi-row decode step (s <= 6) routes too few experts per layer
+        // for a read to amortize, and there the read would sit on the latency path instead of under it
+        // (measured: R=6 decode 151 -> 188 ms/pass with the read set on).  Decode therefore stays
+        // byte-for-byte on the pre-S10 path.
+        ws->pf.active = false;
+        const bool pf_on = s >= ws->pf.min_s && dsv4_pf_layer(ws, experts, layer, groups, peer_on, blob_bytes);
         // [S9c] slots whose previous DMA has retired go back to the ring once per layer
         dsv4_cp_release(ws);
         std::vector<int32_t>& groups0 = ws->h_groups0;
@@ -1869,7 +2063,13 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             }
             if (dst == nullptr) ++n_staged;
             ws->h_ptrs[(size_t) g] = dst;
+            // [S10] the copies queued for this chunk are all on the copy stream now: the kernel stream
+            // only has to wait for them, chunk by chunk, instead of the host waiting for each blob
+            if (pf_on && ws->pf.cs[0] != nullptr && ((g + 1) % ws->chunk) == 0 &&
+                (g + 1) / ws->chunk <= 48)
+                (void) cudaEventRecord(ws->pf.cev[0][(g + 1) / ws->chunk - 1], ws->pf.cs[0]);
         }
+        if (pf_on && ws->pf.cs[0] != nullptr) (void) cudaEventRecord(ws->pf.ev[0], ws->pf.cs[0]);
         // [S8] kSingle=0 forces the chunked path (A/B switch for the one-table launch set)
         static const bool kSingle = std::getenv("STRATA_DSV4_MOE_SINGLE") == nullptr ||
                                     std::atoi(std::getenv("STRATA_DSV4_MOE_SINGLE")) != 0;
@@ -1917,6 +2117,7 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             const int32_t* k_slot = (const int32_t*) (ws->tab + o_s);
             const dim3 gu_grid(gu_blocks, (unsigned) max_m, (unsigned) n_groups);
             const dim3 d_grid(d_blocks, (unsigned) max_m, (unsigned) n_groups);
+            if (pf_on && ws->pf.ev[0] != nullptr) (void) cudaStreamWaitEvent(stream, ws->pf.ev[0], 0);
             if (!dsv4_ablit("STRATA_ABL_NOGEMV")) {
                 dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid, 256, 9216, stream>>>(
                     k_ptrs, 0, (int64_t) fmt.tail_off, 0, ws->yt, n, k_tok, k_ebase, (int) n, (int) inter,
@@ -1941,6 +2142,11 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
         } else {
         for (int64_t z0 = 0; z0 < n_groups; z0 += ws->chunk) {
             const int64_t u = std::min<int64_t>((int64_t) ws->chunk, n_groups - z0);
+            if (pf_on && ws->pf.cs[0] != nullptr) {
+                const int64_t ck = z0 / ws->chunk;
+                if (ck < 48 && ck < (n_groups + ws->chunk - 1) / ws->chunk)
+                    (void) cudaStreamWaitEvent(stream, ws->pf.cev[0][ck], 0);
+            }
             const int32_t entry0 = ebase[(size_t) z0];
             const int64_t entries = (int64_t) ebase[(size_t) (z0 + u)] - entry0;
             int64_t max_m = 0;
@@ -1952,6 +2158,11 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                     const int32_t e = groups0[(size_t) (z0 + zz)];
                     const auto st0 = ton ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     const uint8_t* blob = experts.blob(layer, e);
+                    if (ws->pf.on && ws->pf.active && !ws->pf.over.empty() &&
+                        ws->pf.over[(size_t) e] != nullptr) {
+                        dsv4_pf_wait(ws, e);
+                        blob = ws->pf.over[(size_t) e];
+                    }
                     const auto st1 = ton ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     if (!blob) {
                         err = "dsv4_moe: no blob for the routed expert";
