@@ -720,6 +720,35 @@ struct Dsv4MoeWs {
     double tm_cold_read = 0, tm_cold_fill = 0, tm_cold_staged = 0;
     double tm_pack = 0, tm_tabh2d = 0, tm_lanch = 0;
     int64_t cold_n = 0, cold_staged_n = 0, cold_pipe = 0;
+    /// [PFTIME] STRATA_DSV4_PFTIME=1: sub-phase attribution of ONE MoE call's host path (the s=128
+    /// prefill dispatch).  Read-only instrumentation: every field is a host-clock accumulator or a
+    /// counter guarded by `on`, so a run without the switch takes exactly the path it took before.
+    /// PFTIME=1 also turns STRATA_DSV4_TIME on, so the coarse host/gpu phase lines come along.
+    struct PfTime {
+        bool on = false;
+        double d2h_enq = 0;        ///< route idx/wgt D2H: the cudaMemcpyAsync calls themselves
+        double d2h_sync = 0;       ///< the cudaStreamSynchronize right after them (attention drain)
+        double bitmap = 0;         ///< presence bitmap + ascending group list
+        double pf_layer = 0;       ///< dsv4_pf_layer (incl. the previous layer's reader join)
+        double pf_join = 0;        ///<   ... the reader join alone
+        double pf_peer_sync = 0;   ///<   ... cudaStreamSynchronize(peer.stream) alone
+        double cp_rel = 0;         ///< dsv4_cp_release
+        double peer_loop = 0;      ///< the device-0/1 group split, incl. peer first-touch fills
+        double resolve0 = 0;       ///< the device-0 resolve loop (slot_of + admission + cold fill)
+        double stage_blob = 0;     ///< staging branch: experts.blob() (a full blob assembly)
+        double stage_wait = 0;     ///< staging branch: dsv4_pf_wait (pinned reader still copying)
+        double stage_dma = 0;      ///< staging branch: the H2D enqueue
+        double pack = 0;           ///< pack into the pinned arena (chunk table / single table)
+        double tabh2d = 0;         ///< table H2D
+        double launch = 0;         ///< kernel launches
+        double pintab = 0;         ///< dsv4_pintab_take (waits out the arena's previous copy)
+        double tail_sync = 0;      ///< the layer-end cudaStreamSynchronize
+        int64_t calls = 0, groups = 0, g0 = 0, g1 = 0, entries = 0, chunks = 0, launches = 0;
+        int64_t hit0 = 0, miss0 = 0, admit0 = 0, fail0 = 0, hit1 = 0, miss1 = 0, admit1 = 0, fail1 = 0;
+        int64_t staged = 0, staged_pf = 0, blob_calls = 0, pf_reads = 0;
+        uint64_t dma_bytes = 0, dma_pf_bytes = 0;
+        bool pin_idx = false, pin_wgt = false;
+    } pft;
     /// [S9] The cold-blob pipeline: a small ring of page-locked blob-sized slots.  A cold expert is
     /// read into a ring slot, then copied to its cache slot by a DMA queued on a BYPASS stream, and
     /// the stream that runs the kernels only waits on that copy's event.  The old path read the blob
@@ -830,6 +859,8 @@ Dsv4MoeWs* dsv4_moe_ws_new(const Dsv4Geometry& g, int64_t s, std::string& err) {
             std::fprintf(stderr, "dsv4_moe: STRATA_DSV4_ROUTE_DUMP %s is not writable\n", renv);
     }
     ws->time_on = std::getenv("STRATA_DSV4_TIME") != nullptr;
+    ws->pft.on = std::getenv("STRATA_DSV4_PFTIME") != nullptr;
+    if (ws->pft.on) ws->time_on = true;   // the sub-phases need the event/phase scaffolding
     if (ws->time_on)
         for (cudaEvent_t& ev : ws->tev) {
             if (cudaEventCreate(&ev) != cudaSuccess) ev = nullptr;
@@ -1259,10 +1290,17 @@ static bool dsv4_pf_layer(Dsv4MoeWs* ws, strata::core::FileExpertSource& experts
     pf.cev_n = 0;
     if (!dsv4_pf_init(ws, blob_bytes)) return false;
     if (pf.bytes != (size_t) blob_bytes) return false;
+    const auto pfj0 = ws->pft.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     dsv4_pf_join(ws);                              // the previous layer's readers own the pinned slots
+    const auto pfj1 = ws->pft.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (pf.n_layer > 0) {
         if (pf.ev[0] != nullptr) { (void) cudaEventSynchronize(pf.ev[0]); (void) cudaGetLastError(); }
         if (ws->peer.stream != nullptr) { (void) cudaStreamSynchronize(ws->peer.stream); (void) cudaGetLastError(); }
+    }
+    if (ws->pft.on) {
+        const auto pfj2 = std::chrono::steady_clock::now();
+        ws->pft.pf_join += std::chrono::duration<double, std::milli>(pfj1 - pfj0).count();
+        ws->pft.pf_peer_sync += std::chrono::duration<double, std::milli>(pfj2 - pfj1).count();
     }
     if (pf.over.size() != (size_t) ws->ne) pf.over.assign((size_t) ws->ne, (const uint8_t*) nullptr);
     std::fill(pf.over.begin(), pf.over.end(), (const uint8_t*) nullptr);
@@ -1437,6 +1475,29 @@ void dsv4_moe_ws_report(Dsv4MoeWs* ws, const char* tag) {
                  (double) ws->cp.fell_back / calls);
     std::fprintf(stderr, "dsv4_moe[%s]: coldpipe ring %d slots, %d reader threads, fills %lld\n", tag,
                  ws->cp.n, ws->cp.threads, (long long) ws->cp.queued);
+    if (ws->pft.on && ws->pft.calls > 0) {
+        const Dsv4MoeWs::PfTime& p = ws->pft;
+        const double n = (double) p.calls;
+        std::fprintf(stderr,
+                     "dsv4_pftime[%s]: host ms/call over %lld MoE calls: d2h enq %.3f sync %.3f"
+                     " (pinned idx %d wgt %d) | bitmap %.3f | pf_layer %.3f (join %.3f peer-sync %.3f)"
+                     " cp_rel %.3f | peer split %.3f | resolve0 %.3f | stage blob %.3f wait %.3f dma %.3f"
+                     " | pack %.3f tab-h2d %.3f launch %.3f pintab %.3f | tail sync %.3f\n",
+                     tag, (long long) p.calls, p.d2h_enq / n, p.d2h_sync / n, (int) p.pin_idx,
+                     (int) p.pin_wgt, p.bitmap / n, p.pf_layer / n, p.pf_join / n, p.pf_peer_sync / n,
+                     p.cp_rel / n, (p.peer_loop - p.pf_layer - p.cp_rel) / n, p.resolve0 / n,
+                     p.stage_blob / n, p.stage_wait / n, p.stage_dma / n, p.pack / n, p.tabh2d / n,
+                     p.launch / n, p.pintab / n, p.tail_sync / n);
+        std::fprintf(stderr,
+                     "dsv4_pftime[%s]: per call: groups %.1f (g0 %.1f g1 %.1f) entries %.1f chunks %.1f"
+                     " staged %.1f (pf %.1f) blob_calls %.1f pf_reads %.1f dma %.1f MiB (from pf %.1f)"
+                     " launches %.1f | dev0 hit %.1f miss %.1f admit %.1f fail %.1f"
+                     " | dev1 hit %.1f miss %.1f admit %.1f fail %.1f\n",
+                     tag, p.groups / n, p.g0 / n, p.g1 / n, p.entries / n, p.chunks / n, p.staged / n,
+                     p.staged_pf / n, p.blob_calls / n, p.pf_reads / n, (double) p.dma_bytes / n / 1048576.0,
+                     (double) p.dma_pf_bytes / n / 1048576.0, p.launches / n, p.hit0 / n, p.miss0 / n,
+                     p.admit0 / n, p.fail0 / n, p.hit1 / n, p.miss1 / n, p.admit1 / n, p.fail1 / n);
+    }
 }
 
 void dsv4_moe_ws_free(Dsv4MoeWs* ws) {
@@ -1720,12 +1781,27 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
     const auto tp1 = std::chrono::steady_clock::now();
 
     // ---- the routing decision back to the host (78 int + 78 float at the golden prompt: negligible)
+    const bool pft_on = ws->pft.on;
+    if (pft_on && ws->pft.calls == 0) {
+        // once: are the two route D2H destinations page-locked, or does the driver bounce them?
+        cudaPointerAttributes pai{}, paw{};
+        ws->pft.pin_idx = cudaPointerGetAttributes(&pai, ws->h_idx.data()) == cudaSuccess &&
+                          pai.type == cudaMemoryTypeHost;
+        ws->pft.pin_wgt = cudaPointerGetAttributes(&paw, ws->h_wgt.data()) == cudaSuccess &&
+                          paw.type == cudaMemoryTypeHost;
+    }
+    const auto pfdh0 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CKM(cudaMemcpyAsync(ws->h_idx.data(), ws->idx, (size_t) (s * nk) * 4, cudaMemcpyDeviceToHost,
                         stream));
     CKM(cudaMemcpyAsync(ws->h_wgt.data(), ws->wgt, (size_t) (s * nk) * 4, cudaMemcpyDeviceToHost,
                         stream));
+    const auto pfdh1 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CKM(cudaStreamSynchronize(stream));
     const auto tp2 = std::chrono::steady_clock::now();
+    if (pft_on) {
+        ws->pft.d2h_enq += std::chrono::duration<double, std::milli>(pfdh1 - pfdh0).count();
+        ws->pft.d2h_sync += std::chrono::duration<double, std::milli>(tp2 - pfdh1).count();
+    }
     if (ton) {
         ws->tm_pre += std::chrono::duration<double, std::milli>(tp1 - tp0).count();
         ws->tm_sync += std::chrono::duration<double, std::milli>(tp2 - tp1).count();
@@ -1814,6 +1890,7 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
         // slots over P2P measures ~0.9 GiB/s inside the GEMV, so the weights never cross PCIe - only
         // the input (16 KiB per token) and the outputs (entries*n*4) do.
         std::vector<int32_t>& groups = ws->h_groups;
+        const auto pfm0 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         groups.clear();
         // [S8] the layer's unique experts come straight out of a presence bitmap in ascending expert
         // id - byte for byte the order std::sort + std::unique produced (the reference's accumulation
@@ -1831,6 +1908,12 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             if (mask[(size_t) (e >> 6)] & (1ull << (e & 63))) groups.push_back((int32_t) e);
         const auto g1t = ton ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (ton) ws->tm_g1 += std::chrono::duration<double, std::milli>(g1t - tp2).count();
+        if (pft_on) {
+            ws->pft.bitmap += std::chrono::duration<double, std::milli>(g1t - pfm0).count();
+            ws->pft.groups += (int64_t) groups.size();
+            ws->pft.calls += 1;
+            ws->pft.pf_reads += ws->pf.n_jobs;
+        }
         const unsigned gu_blocks = (unsigned) (inter / (256 / (n / 64)));        // 2048 / 4
         const unsigned d_blocks = (unsigned) (n / (256 / (inter / 64)));         // 4096 / 8
         const uint64_t blob_bytes = (uint64_t) lay.blob_bytes(layer);
@@ -1844,9 +1927,16 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
         // (measured: R=6 decode 151 -> 188 ms/pass with the read set on).  Decode therefore stays
         // byte-for-byte on the pre-S10 path.
         ws->pf.active = false;
+        const auto pfpl0 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const bool pf_on = s >= ws->pf.min_s && dsv4_pf_layer(ws, experts, layer, groups, peer_on, blob_bytes);
+        const auto pfpl1 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         // [S9c] slots whose previous DMA has retired go back to the ring once per layer
         dsv4_cp_release(ws);
+        if (pft_on) {
+            ws->pft.pf_layer += std::chrono::duration<double, std::milli>(pfpl1 - pfpl0).count();
+            ws->pft.cp_rel += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - pfpl1).count();
+        }
         std::vector<int32_t>& groups0 = ws->h_groups0;
         std::vector<int32_t>& groups1 = ws->h_groups1;
         std::vector<uint8_t*>& ptrs1 = ws->h_ptrs1;
@@ -1894,6 +1984,8 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
         // the prefix sum of the per-expert counts gathered with the bitmap above.
         const auto g2t = ton ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (ton) ws->tm_g2 += std::chrono::duration<double, std::milli>(g2t - g1t).count();
+        // g2 minus pf_layer minus cp_rel is the split itself (and the peer first-touch fills)
+        if (pft_on) ws->pft.peer_loop += std::chrono::duration<double, std::milli>(g2t - g1t).count();
         std::vector<int32_t>& ebase = ws->h_ebase;
         std::vector<int32_t>& tokg = ws->h_tokg;
         std::vector<float>& pwg = ws->h_pwg;
@@ -2040,6 +2132,7 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
         // same weights and its own comb6 cell (dsv4_comb_cell), so the combine's ascending-expert-id
         // / shared-last order is untouched.
         int64_t n_staged = 0;
+        const auto pfrv0 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         for (int64_t g = 0; g < n_groups; ++g) {
             const int32_t e = groups0[(size_t) g];
             uint8_t* dst = nullptr;
@@ -2052,6 +2145,7 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                 if (resident >= 0) {
                     dst = C->device_slot(resident);
                     ++ws->cache_hits;
+                    if (pft_on) ++ws->pft.hit0;
                 } else {
                     bool failed = false;
                     const int32_t slot = dsv4_admit_heat(ws, C, experts, layer, e, groups0, stream,
@@ -2059,6 +2153,11 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                     if (failed) return false;
                     if (slot >= 0) dst = C->device_slot(slot);
                     ++ws->cache_misses;
+                    if (pft_on) {
+                        ++ws->pft.miss0;
+                        if (slot >= 0) { ++ws->pft.admit0; ws->pft.dma_bytes += blob_bytes; }
+                        else ++ws->pft.fail0;
+                    }
                 }
             }
             if (dst == nullptr) ++n_staged;
@@ -2070,6 +2169,15 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                 (void) cudaEventRecord(ws->pf.cev[0][(g + 1) / ws->chunk - 1], ws->pf.cs[0]);
         }
         if (pf_on && ws->pf.cs[0] != nullptr) (void) cudaEventRecord(ws->pf.ev[0], ws->pf.cs[0]);
+        if (pft_on) {
+            ws->pft.resolve0 += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - pfrv0).count();
+            ws->pft.g0 += (int64_t) groups0.size();
+            ws->pft.g1 += (int64_t) groups1.size();
+            ws->pft.staged += n_staged;
+            ws->pft.entries += (int64_t) tokg.size() + (int64_t) ws->h_tokg1.size();
+            ws->pft.chunks += n_groups > 0 ? (n_groups + ws->chunk - 1) / ws->chunk : 0;
+        }
         // [S8] kSingle=0 forces the chunked path (A/B switch for the one-table launch set)
         static const bool kSingle = std::getenv("STRATA_DSV4_MOE_SINGLE") == nullptr ||
                                     std::atoi(std::getenv("STRATA_DSV4_MOE_SINGLE")) != 0;
@@ -2138,6 +2246,12 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                 ws->tm_pack += std::chrono::duration<double, std::milli>(pt1 - pt0).count();
                 ws->tm_tabh2d += std::chrono::duration<double, std::milli>(pt2 - pt1).count();
                 ws->tm_lanch += std::chrono::duration<double, std::milli>(pt3 - pt2).count();
+                if (pft_on) {
+                    ws->pft.pack += std::chrono::duration<double, std::milli>(pt1 - pt0).count();
+                    ws->pft.tabh2d += std::chrono::duration<double, std::milli>(pt2 - pt1).count();
+                    ws->pft.launch += std::chrono::duration<double, std::milli>(pt3 - pt2).count();
+                    ws->pft.launches += 5;
+                }
             }
         } else {
         for (int64_t z0 = 0; z0 < n_groups; z0 += ws->chunk) {
@@ -2157,13 +2271,22 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                 if (dst == nullptr) {
                     const int32_t e = groups0[(size_t) (z0 + zz)];
                     const auto st0 = ton ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    const auto pfsb0 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     const uint8_t* blob = experts.blob(layer, e);
-                    if (ws->pf.on && ws->pf.active && !ws->pf.over.empty() &&
-                        ws->pf.over[(size_t) e] != nullptr) {
+                    const auto pfsb1 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    const bool pf_hit = ws->pf.on && ws->pf.active && !ws->pf.over.empty() &&
+                                        ws->pf.over[(size_t) e] != nullptr;
+                    if (pf_hit) {
                         dsv4_pf_wait(ws, e);
                         blob = ws->pf.over[(size_t) e];
                     }
                     const auto st1 = ton ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    if (pft_on) {
+                        ws->pft.stage_blob += std::chrono::duration<double, std::milli>(pfsb1 - pfsb0).count();
+                        ws->pft.stage_wait += std::chrono::duration<double, std::milli>(st1 - pfsb1).count();
+                        ++ws->pft.blob_calls;
+                        if (pf_hit) ++ws->pft.staged_pf;
+                    }
                     if (!blob) {
                         err = "dsv4_moe: no blob for the routed expert";
                         return false;
@@ -2173,9 +2296,17 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                     if (dsv4_ablit("STRATA_ABL_NODMA")) {
                         uint8_t* scratch = dsv4_abl_scratch((size_t) blob_bytes);
                         if (scratch != nullptr) std::memcpy(scratch, blob, (size_t) blob_bytes);
-                    } else if (!dsv4_ablit("STRATA_ABL_NOCOPY"))
+                    } else if (!dsv4_ablit("STRATA_ABL_NOCOPY")) {
+                        const auto pfdm0 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                         CKM(cudaMemcpyAsync(dst, blob, (size_t) blob_bytes, cudaMemcpyHostToDevice,
                                             stream));
+                        if (pft_on) {
+                            ws->pft.stage_dma += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - pfdm0).count();
+                            ws->pft.dma_bytes += blob_bytes;
+                            if (pf_hit) ws->pft.dma_pf_bytes += blob_bytes;
+                        }
+                    }
                     if (ton) {
                         ws->tm_cold_read += std::chrono::duration<double, std::milli>(st1 - st0).count();
                         ws->tm_cold_staged +=
@@ -2204,7 +2335,9 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             // five launches of a chunk in between it is never actually still running)
             Dsv4MoeWs::PinTab& T = ws->pin[ws->pin_turn & 1];
             ws->pin_turn ^= 1;
+            const auto pfcp0 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             uint8_t* H = dsv4_pintab_take(T, need);
+            const auto pfcp1 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (H == nullptr) {
                 ws->h_tab.resize(need);
                 H = ws->h_tab.data();
@@ -2216,8 +2349,15 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             std::memcpy(H + o_t, tokg.data() + entry0, (size_t) entries * 4);
             std::memcpy(H + o_w, pwg.data() + entry0, (size_t) entries * 4);
             std::memcpy(H + o_s, ws->h_slotg.data() + entry0, (size_t) entries * 4);
+            const auto pfcp2 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             CKM(cudaMemcpyAsync(ws->tab, H, need, cudaMemcpyHostToDevice, stream));
             dsv4_pintab_queued(T, H, stream);
+            const auto pfcp3 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (pft_on) {
+                ws->pft.pintab += std::chrono::duration<double, std::milli>(pfcp1 - pfcp0).count();
+                ws->pft.pack += std::chrono::duration<double, std::milli>(pfcp2 - pfcp1).count();
+                ws->pft.tabh2d += std::chrono::duration<double, std::milli>(pfcp3 - pfcp2).count();
+            }
             const uint8_t* const* k_ptrs = (const uint8_t* const*) ws->tab;
             const int32_t* k_ebase = (const int32_t*) (ws->tab + o_e);
             const int32_t* k_tok = (const int32_t*) (ws->tab + o_t);
@@ -2240,6 +2380,7 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                 dsv4_scatter_rows_kernel<<<(unsigned) entries, 256, 0, stream>>>(ws->pout, k_slot,
                                                                                 ws->comb6, n);
             }
+            if (pft_on) ws->pft.launches += 5;
         }
         }
         if (tev_ok) CKM(cudaEventRecord(ws->tev[1], stream));
@@ -2288,7 +2429,11 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
     // consumer of h2/d_h is a kernel on this same stream, so leaving it out lets the host queue the
     // next layer's attention while the GPU is still finishing these groups (43 pipeline drains per
     // pass off the critical path; the arithmetic is untouched).
+    const auto pfts0 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (ton) CKM(cudaStreamSynchronize(stream));
+    if (pft_on)
+        ws->pft.tail_sync +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pfts0).count();
     if (ton) {
         ws->tm_tail += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                                  tp4)
