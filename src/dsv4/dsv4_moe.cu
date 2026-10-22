@@ -748,12 +748,20 @@ struct Dsv4MoeWs {
     int32_t* d_slot = nullptr;           ///< device: entry -> comb6 cell (token * nk + rank)
     // [S7a] grouped staging: chunk blobs staged side by side, one grouped launch per role per chunk
     int chunk = 0;                       ///< staged blobs per grouped pass (STRATA_DSV4_MOE_CHUNK, dflt 8)
-    uint8_t* blob_stage = nullptr;       ///< chunk * blob_bytes
+    // [H3] TWO staging arenas.  With one arena the H2D of chunk i+1 could not even be enqueued until
+    // chunk i's five launches had finished reading it (the copy is on the kernel stream), so the host
+    // stalled a couple of ms per chunk and then waited ~23.5 ms at the layer tail.  With two arenas
+    // and the copy on the prefetch stream, chunk i+1's bytes travel while chunk i computes.
+    cudaStream_t bstage_stream = nullptr;           ///< [H3] staging copies ride here, not on the compute stream
+    cudaEvent_t bstage_ev[2] = {nullptr, nullptr};   ///< that arena's H2D is complete (copy stream)
+    cudaEvent_t bstage_done[2] = {nullptr, nullptr}; ///< that arena's chunk has left the GPU
+    uint8_t* blob_stage = nullptr;       ///< 2 * chunk * blob_bytes
     // [M3] STRATA_DSV4_MOE_STAGE=1: the staged blobs travel host -> PINNED slot -> H2D, replacing the
-    // pageable source whose driver bounce-buffer copy blocks this thread.  The H2D stays on the KERNEL
-    // stream on purpose: `dst` is the one staging arena the compute stream is still reading across chunk
-    // boundaries, so the DMA must be ordered behind those readers; a side stream needs a double-buffered
-    // arena (measured: +113 MB, no wall-clock gain -- see REPORT-PREFILL-MOE.md section 3.2).
+    // pageable source whose driver bounce-buffer copy blocks this thread.  Its H2D stays on the KERNEL
+    // stream.  [H3] the DEFAULT staging path no longer does: it has two arenas and copies on the
+    // prefetch stream (REPORT-PREFILL-HOST2.md section 3), which is what the old "needs a
+    // double-buffered arena (measured: +113 MB, no wall-clock gain)" note was asking for -- the earlier
+    // measurement was taken while every other host wait was still in place.
     uint8_t* pin_stage = nullptr;        ///< pin_slots * blob_bytes, page-locked
     cudaEvent_t stage_ev[8] = {};        ///< [M3] one per pinned slot: fires when its H2D has consumed the slot
     int pin_slots = 0;
@@ -776,7 +784,21 @@ struct Dsv4MoeWs {
         cudaEvent_t ev = nullptr;
         bool live = false;
     };
-    PinTab pin[2];                       ///< device-0 table arenas, alternating per upload
+    // [H2] device-0 table arenas, rotating per upload.  Two was not enough: with ~9 chunks per layer
+    // the second upload lands while the previous chunk's five launches are still running, so
+    // `pintab_take` waited ~2.2 ms per chunk (18.7 ms/layer measured).  Eight arenas rotate far
+    // enough back that the copy which last used the slot has long completed, and each arena is only
+    // a few tens of KiB.
+    static constexpr int kPinTabs = 8;
+    PinTab pin[kPinTabs];
+    /// every table arena (the device-0 ring plus the peer's), for allocation and teardown
+    std::vector<PinTab*> pin_all() {
+        std::vector<PinTab*> v;
+        v.reserve(kPinTabs + 1);
+        for (int i = 0; i < kPinTabs; ++i) v.push_back(&pin[i]);
+        v.push_back(&pin_peer);
+        return v;
+    }
     int pin_turn = 0;
     PinTab pin_peer;                     ///< peer table arena (copied on the peer stream)
     // shared expert
@@ -785,6 +807,15 @@ struct Dsv4MoeWs {
     // host mirrors
     std::vector<int32_t> h_idx;
     std::vector<float> h_wgt;
+    // [H2] the routing D2H used to land in the std::vectors above, i.e. PAGEABLE memory.  A pageable
+    // cudaMemcpyAsync does not return until the copy (and everything queued ahead of it on the
+    // stream) has completed, so the 18.8 ms the attention queue takes showed up as *enqueue* time and
+    // the host was stuck inside the API.  These pinned mirrors make the enqueue a real enqueue; the
+    // wait below is then an explicit event wait that can be moved (and, on the CPU-arm path, overlaps
+    // the y copy).
+    int32_t* h_idx_pin = nullptr;
+    float* h_wgt_pin = nullptr;
+    cudaEvent_t route_ev = nullptr;
     std::vector<float> h_x, h_bout;
     // [S7a] host staging for the grouped pass
     std::vector<int32_t> h_groups;       ///< unique experts of the layer, sorted (the reference's order)
@@ -1101,7 +1132,14 @@ Dsv4MoeWs* dsv4_moe_ws_new(const Dsv4Geometry& g, int64_t s, std::string& err) {
         ws->chunk = cenv ? std::atoi(cenv) : 8;
         if (ws->chunk < 1) ws->chunk = 1;
         if (ws->chunk > 32) ws->chunk = 32;   // 32 x 14.16 MB = 453 MB of staging at most
-        CKM(cudaMalloc(&ws->blob_stage, (size_t) ws->chunk * ws->blob_bytes));
+        CKM(cudaMalloc(&ws->blob_stage, (size_t) 2 * ws->chunk * ws->blob_bytes));
+        // a stream of its own: the prefetch ring has its own DMA queue and the two must not serialize
+        // each other (sharing it made the wall-clock bimodal: 96.8 s vs 103.7 s on identical input)
+        CKM(cudaStreamCreateWithFlags(&ws->bstage_stream, cudaStreamNonBlocking));
+        for (int a = 0; a < 2; ++a) {
+            CKM(cudaEventCreateWithFlags(&ws->bstage_ev[a], cudaEventDisableTiming));
+            CKM(cudaEventCreateWithFlags(&ws->bstage_done[a], cudaEventDisableTiming));
+        }
         CKM(cudaMalloc(&ws->d_ptrs, (size_t) ws->chunk * sizeof(uint8_t*)));
         CKM(cudaMalloc(&ws->d_ebase, (size_t) (ws->chunk + 1) * 4));
         {
@@ -1123,10 +1161,15 @@ Dsv4MoeWs* dsv4_moe_ws_new(const Dsv4Geometry& g, int64_t s, std::string& err) {
                 (size_t) 64 + gmax * sizeof(uint8_t*) + (gmax + 1) * 4 + 3 * gmax * 4;
             const size_t cap1 = (size_t) 64 + (size_t) ws->ne * sizeof(uint8_t*) +
                                 ((size_t) ws->ne + 1) * 4 + 3 * gmax * 4;
-            Dsv4MoeWs::PinTab* tabs[3] = {&ws->pin[0], &ws->pin[1], &ws->pin_peer};
-            const size_t caps[3] = {cap0, cap0, cap1};
+            const int kTabs = Dsv4MoeWs::kPinTabs + 1;
+            Dsv4MoeWs::PinTab* tabs[Dsv4MoeWs::kPinTabs + 1] = {};
+            for (int t = 0; t < Dsv4MoeWs::kPinTabs; ++t) tabs[t] = &ws->pin[t];
+            tabs[Dsv4MoeWs::kPinTabs] = &ws->pin_peer;
+            size_t caps[Dsv4MoeWs::kPinTabs + 1] = {};
+            for (int t = 0; t < Dsv4MoeWs::kPinTabs; ++t) caps[t] = cap0;
+            caps[Dsv4MoeWs::kPinTabs] = cap1;
             bool pin_ok = !kBisNoPin;
-            for (int t = 0; pin_ok && t < 3; ++t) {
+            for (int t = 0; pin_ok && t < kTabs; ++t) {
                 if (cudaHostAlloc((void**) &tabs[t]->p, caps[t], cudaHostAllocPortable) !=
                     cudaSuccess) {
                     (void) cudaGetLastError();
@@ -1140,7 +1183,7 @@ Dsv4MoeWs* dsv4_moe_ws_new(const Dsv4Geometry& g, int64_t s, std::string& err) {
             // the upload events belong to the device whose stream they are recorded on: the two
             // device-0 arenas get theirs here, the peer arena gets its own in ws_set_cache (device 1)
             if (pin_ok) {
-                for (int t = 0; t < 2; ++t) {
+                for (int t = 0; t < Dsv4MoeWs::kPinTabs; ++t) {
                     if (cudaEventCreateWithFlags(&tabs[t]->ev, cudaEventDisableTiming) !=
                         cudaSuccess) {
                         (void) cudaGetLastError();
@@ -1149,7 +1192,7 @@ Dsv4MoeWs* dsv4_moe_ws_new(const Dsv4Geometry& g, int64_t s, std::string& err) {
                 }
             }
             if (!pin_ok) {
-                for (int t = 0; t < 3; ++t) {
+                for (int t = 0; t < kTabs; ++t) {
                     if (tabs[t]->p != nullptr) cudaFreeHost(tabs[t]->p);
                     tabs[t]->p = nullptr;
                     tabs[t]->cap = 0;
@@ -1214,6 +1257,14 @@ Dsv4MoeWs* dsv4_moe_ws_new(const Dsv4Geometry& g, int64_t s, std::string& err) {
     CKM(cudaMalloc(&ws->d_slot, (size_t) m * 4));
     ws->h_idx.resize((size_t) m);
     ws->h_wgt.resize((size_t) m);
+    if (cudaHostAlloc((void**) &ws->h_idx_pin, (size_t) m * 4, cudaHostAllocPortable) != cudaSuccess ||
+        cudaHostAlloc((void**) &ws->h_wgt_pin, (size_t) m * 4, cudaHostAllocPortable) != cudaSuccess ||
+        cudaEventCreateWithFlags(&ws->route_ev, cudaEventDisableTiming) != cudaSuccess) {
+        (void) cudaGetLastError();
+        if (ws->h_idx_pin) { cudaFreeHost(ws->h_idx_pin); ws->h_idx_pin = nullptr; }
+        if (ws->h_wgt_pin) { cudaFreeHost(ws->h_wgt_pin); ws->h_wgt_pin = nullptr; }
+        if (ws->route_ev) { cudaEventDestroy(ws->route_ev); ws->route_ev = nullptr; }
+    }
     ws->h_x.resize((size_t) (s * n));
     ws->h_bout.resize((size_t) (s * n));
     // [S8] size every host staging buffer the per-layer table build touches ONCE; the per-call
@@ -1949,6 +2000,20 @@ void dsv4_moe_ws_free(Dsv4MoeWs* ws) {
         std::free(ws->cpu_scratch);
         ws->cpu_scratch = nullptr;
     }
+    if (ws->h_idx_pin != nullptr) (void) cudaFreeHost(ws->h_idx_pin);
+    if (ws->h_wgt_pin != nullptr) (void) cudaFreeHost(ws->h_wgt_pin);
+    for (int a = 0; a < 2; ++a) {
+        if (ws->bstage_ev[a] != nullptr) cudaEventDestroy(ws->bstage_ev[a]);
+        if (ws->bstage_done[a] != nullptr) cudaEventDestroy(ws->bstage_done[a]);
+        ws->bstage_ev[a] = nullptr;
+        ws->bstage_done[a] = nullptr;
+    }
+    if (ws->bstage_stream != nullptr) cudaStreamDestroy(ws->bstage_stream);
+    ws->bstage_stream = nullptr;
+    if (ws->route_ev != nullptr) cudaEventDestroy(ws->route_ev);
+    ws->h_idx_pin = nullptr;
+    ws->h_wgt_pin = nullptr;
+    ws->route_ev = nullptr;
     if (ws->cpu_ev != nullptr) cudaEventDestroy(ws->cpu_ev);
     if (ws->cpu_stream != nullptr) cudaStreamDestroy(ws->cpu_stream);
     for (void* p : {ws->h_cg, ws->h_cu, ws->h_act, ws->h_cout, ws->h_cpw})
@@ -1974,7 +2039,7 @@ void dsv4_moe_ws_free(Dsv4MoeWs* ws) {
     cudaFree(ws->d_ptrs);
     cudaFree(ws->d_ebase);
     cudaFree(ws->tab);
-    for (Dsv4MoeWs::PinTab* t : {&ws->pin[0], &ws->pin[1], &ws->pin_peer}) {
+    for (Dsv4MoeWs::PinTab* t : ws->pin_all()) {
         if (t->ev != nullptr) cudaEventDestroy(t->ev);
         t->ev = nullptr;
         if (t->p != nullptr) cudaFreeHost(t->p);
@@ -2403,24 +2468,36 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
     if (pft_on && ws->pft.calls == 0) {
         // once: are the two route D2H destinations page-locked, or does the driver bounce them?
         cudaPointerAttributes pai{}, paw{};
-        ws->pft.pin_idx = cudaPointerGetAttributes(&pai, ws->h_idx.data()) == cudaSuccess &&
+        const void* pi = ws->h_idx_pin != nullptr ? (const void*) ws->h_idx_pin : (const void*) ws->h_idx.data();
+        const void* pw_ = ws->h_wgt_pin != nullptr ? (const void*) ws->h_wgt_pin : (const void*) ws->h_wgt.data();
+        ws->pft.pin_idx = cudaPointerGetAttributes(&pai, pi) == cudaSuccess &&
                           pai.type == cudaMemoryTypeHost;
-        ws->pft.pin_wgt = cudaPointerGetAttributes(&paw, ws->h_wgt.data()) == cudaSuccess &&
+        ws->pft.pin_wgt = cudaPointerGetAttributes(&paw, pw_) == cudaSuccess &&
                           paw.type == cudaMemoryTypeHost;
     }
     const auto pfdh0 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto mtdh0 = std::chrono::steady_clock::now();
-    CKM(cudaMemcpyAsync(ws->h_idx.data(), ws->idx, (size_t) (s * nk) * 4, cudaMemcpyDeviceToHost,
-                        stream));
-    CKM(cudaMemcpyAsync(ws->h_wgt.data(), ws->wgt, (size_t) (s * nk) * 4, cudaMemcpyDeviceToHost,
-                        stream));
+    // [H2] pinned destinations: everything below is the same bytes, only the landing buffer changed
+    int32_t* const r_idx = ws->h_idx_pin != nullptr ? ws->h_idx_pin : ws->h_idx.data();
+    float* const r_wgt = ws->h_wgt_pin != nullptr ? ws->h_wgt_pin : ws->h_wgt.data();
+    CKM(cudaMemcpyAsync(r_idx, ws->idx, (size_t) (s * nk) * 4, cudaMemcpyDeviceToHost, stream));
+    CKM(cudaMemcpyAsync(r_wgt, ws->wgt, (size_t) (s * nk) * 4, cudaMemcpyDeviceToHost, stream));
     // [S11] the CPU arm's input rows.  Enqueued here, before the route sync this call already pays, so
     // the layer's y (the exact rows the GPU reads through yt) costs no extra wait; n=0 never enqueues it
     // and the default path is byte-for-byte unchanged.
     if (ws->cpu_experts > 0)
         CKM(cudaMemcpyAsync(ws->h_x.data(), ws->y, (size_t) (s * n) * 4, cudaMemcpyDeviceToHost, stream));
     const auto pfdh1 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    CKM(cudaStreamSynchronize(stream));
+    // [H2] wait on the routing copies only (an event, not the whole stream), then publish the pinned
+    // bytes into the vectors the rest of the layer reads.  With no pinned arena this is the old sync.
+    if (ws->route_ev != nullptr) {
+        CKM(cudaEventRecord(ws->route_ev, stream));
+        CKM(cudaEventSynchronize(ws->route_ev));
+    } else {
+        CKM(cudaStreamSynchronize(stream));
+    }
+    if (ws->h_idx_pin != nullptr) std::memcpy(ws->h_idx.data(), r_idx, (size_t) (s * nk) * 4);
+    if (ws->h_wgt_pin != nullptr) std::memcpy(ws->h_wgt.data(), r_wgt, (size_t) (s * nk) * 4);
     const auto tp2 = std::chrono::steady_clock::now();
     if (g_moe_time.on) g_moe_time.host_route_block_ms += moe_time_now_ms(mtdh0);
     if (pft_on) {
@@ -2874,8 +2951,8 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             const size_t need = o_s + (size_t) entries * 4;
             // the arenas alternate, and `take` waits out the copy that last used this one (with the
             // five launches of a chunk in between it is never actually still running)
-            Dsv4MoeWs::PinTab& T = ws->pin[ws->pin_turn & 1];
-            ws->pin_turn ^= 1;
+            Dsv4MoeWs::PinTab& T = ws->pin[ws->pin_turn & (Dsv4MoeWs::kPinTabs - 1)];
+            ws->pin_turn = (ws->pin_turn + 1) & (Dsv4MoeWs::kPinTabs - 1);
             const auto pt0 = ton ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             uint8_t* H = dsv4_pintab_take(T, need);
             if (H == nullptr) {
@@ -2937,6 +3014,13 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
         int64_t stage_slot = 0;   // [M3] ring index into ws->pin_stage
         for (int64_t z0 = 0; z0 < n_groups; z0 += ws->chunk) {
             const int64_t u = std::min<int64_t>((int64_t) ws->chunk, n_groups - z0);
+            // [H3] the two staging arenas alternate per chunk and the copies go out on the prefetch
+            // stream, so chunk i+1's blobs are already in flight while chunk i's launches run.
+            const int64_t ck = z0 / ws->chunk;
+            const int arena = (int) (ck & 1);
+            cudaStream_t cstream = (ws->bstage_stream != nullptr) ? ws->bstage_stream : stream;
+            uint8_t* const stage_arena = ws->blob_stage + (size_t) arena * (size_t) ws->chunk * ws->blob_bytes;
+            if (cstream != stream && ck >= 2) CKM(cudaEventSynchronize(ws->bstage_done[arena]));
             int mt_pfw = -1;
             if (g_moe_time.on) mt_pfw = g_moe_time.begin(kMhPfWait, stream);
             if (pf_on && ws->pf.cs[0] != nullptr) {
@@ -2977,7 +3061,7 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                         err = "dsv4_moe: no blob for the routed expert";
                         return false;
                     }
-                    dst = ws->blob_stage + (size_t) zz * blob_bytes;
+                    dst = stage_arena + (size_t) zz * blob_bytes;
                     if (dsv4_ablit("STRATA_ABL_NOREAD")) blob = dsv4_abl_scratch((size_t) blob_bytes);
                     if (dsv4_ablit("STRATA_ABL_NODMA")) {
                         uint8_t* scratch = dsv4_abl_scratch((size_t) blob_bytes);
@@ -3005,8 +3089,10 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                             CKM(cudaEventRecord(ws->stage_ev[sl], stream));
                             ++stage_slot;
                         } else {
+                            // [H3] queued on the copy stream: the compute stream only waits for the
+                            // completion event below, so the DMA overlaps the previous chunk
                             CKM(cudaMemcpyAsync(dst, blob, (size_t) blob_bytes, cudaMemcpyHostToDevice,
-                                                stream));
+                                                cstream));
                         }
                         if (pft_on) {
                             ws->pft.stage_dma += std::chrono::duration<double, std::milli>(
@@ -3028,6 +3114,10 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                 if (mz > max_m) max_m = mz;
             }
             if (g_moe_time.on) g_moe_time.end(mt_stage, stream);
+            if (cstream != stream) {
+                CKM(cudaEventRecord(ws->bstage_ev[arena], cstream));
+                CKM(cudaStreamWaitEvent(stream, ws->bstage_ev[arena], 0));
+            }
             // chunk-local ebase (the kernels index gate/up/ph/pout by chunk-local entry)
             for (int64_t zz = 0; zz <= u; ++zz)
                 ws->h_ebase_c[(size_t) zz] = ebase[(size_t) (z0 + zz)] - entry0;
@@ -3042,8 +3132,8 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             const size_t need = o_s + (size_t) entries * 4;
             // the arenas alternate, and `take` waits out the copy that last used this one (with the
             // five launches of a chunk in between it is never actually still running)
-            Dsv4MoeWs::PinTab& T = ws->pin[ws->pin_turn & 1];
-            ws->pin_turn ^= 1;
+            Dsv4MoeWs::PinTab& T = ws->pin[ws->pin_turn & (Dsv4MoeWs::kPinTabs - 1)];
+            ws->pin_turn = (ws->pin_turn + 1) & (Dsv4MoeWs::kPinTabs - 1);
             const auto pfcp0 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             uint8_t* H = dsv4_pintab_take(T, need);
             const auto pfcp1 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -3094,6 +3184,9 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                                                                                 ws->comb6, n);
                 if (g_moe_time.on) g_moe_time.end(mt_w[4], stream);
             }
+            // [H3] the arena is free once these launches have read it; the host only blocks on this
+            // two chunks later, by which time it has long completed.
+            if (cstream != stream) CKM(cudaEventRecord(ws->bstage_done[arena], stream));
             if (pft_on) ws->pft.launches += 5;
         }
         }
