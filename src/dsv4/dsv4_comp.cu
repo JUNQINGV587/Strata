@@ -28,6 +28,9 @@
 
 #include "strata/dsv4/comp.hpp"
 
+#include "dsv4_attn_time.h"
+
+#include <chrono>
 #include <cuda_bf16.h>
 
 #include <algorithm>
@@ -478,12 +481,15 @@ int64_t dsv4_comp_forward(const Dsv4CompWeights& w, Dsv4CompState& st, Dsv4CompW
         std::abort();
     }
     // kv/score projections: [s][W] each, BF16 weights, double accumulation
-    dsv4_gemm_bf16_kernel<<<(unsigned) W, 128, 0, stream>>>(w.wkv, (int) W, kNEmbd, x, (int) s,
-                                                            ws.kv);
-    DSV4_CK(cudaGetLastError());
-    dsv4_gemm_bf16_kernel<<<(unsigned) W, 128, 0, stream>>>(w.wgate, (int) W, kNEmbd, x, (int) s,
-                                                            ws.score);
-    DSV4_CK(cudaGetLastError());
+    {
+        AttnTimeScope t(kAtCompGemm, stream);
+        dsv4_gemm_bf16_kernel<<<(unsigned) W, 128, 0, stream>>>(w.wkv, (int) W, kNEmbd, x, (int) s,
+                                                                ws.kv);
+        DSV4_CK(cudaGetLastError());
+        dsv4_gemm_bf16_kernel<<<(unsigned) W, 128, 0, stream>>>(w.wgate, (int) W, kNEmbd, x, (int) s,
+                                                                ws.score);
+        DSV4_CK(cudaGetLastError());
+    }
 
     int64_t ncomp = 0;
     if (start_pos == 0) {
@@ -495,6 +501,7 @@ int64_t dsv4_comp_forward(const Dsv4CompWeights& w, Dsv4CompState& st, Dsv4CompW
             DSV4_CK(cudaMemcpyAsync(st.kv_state, ws.kv + (size_t) (cutoff - ratio) * W,
                                     (size_t) (ratio * W) * 4, cudaMemcpyDeviceToDevice, stream));
             const int64_t n = ratio * W;
+            AttnTimeScope t(kAtCompPool, stream);
             dsv4_comp_ape_store_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>(
                 st.score_state, ws.score + (size_t) (cutoff - ratio) * W, w.ape, n);
             DSV4_CK(cudaGetLastError());
@@ -508,6 +515,7 @@ int64_t dsv4_comp_forward(const Dsv4CompWeights& w, Dsv4CompState& st, Dsv4CompW
             DSV4_CK(cudaMemcpyAsync(st.kv_state + (size_t) offset * W, ws.kv + (size_t) cutoff * W,
                                     (size_t) (rem * W) * 4, cudaMemcpyDeviceToDevice, stream));
             const int64_t n = rem * W;
+            AttnTimeScope t(kAtCompPool, stream);
             dsv4_comp_ape_store_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>(
                 st.score_state + (size_t) offset * W, ws.score + (size_t) cutoff * W, w.ape, n);
             DSV4_CK(cudaGetLastError());
@@ -519,6 +527,7 @@ int64_t dsv4_comp_forward(const Dsv4CompWeights& w, Dsv4CompState& st, Dsv4CompW
         if (!should) return 0;
         ncomp = cutoff / ratio;
         const int64_t n = ncomp * d;
+        AttnTimeScope t(kAtCompPool, stream);
         dsv4_comp_pool_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>(
             ws.kv, ws.score, w.ape, ncomp, d, ratio, (int) coff, ws.kv_c);
         DSV4_CK(cudaGetLastError());
@@ -539,6 +548,7 @@ int64_t dsv4_comp_forward(const Dsv4CompWeights& w, Dsv4CompState& st, Dsv4CompW
                 DSV4_CK(cudaMemcpyAsync(st.raw_state + (size_t) dst_row * W, ws.score + (size_t) j * W,
                                         (size_t) W * 4, cudaMemcpyDeviceToDevice, stream));
             } else {
+                AttnTimeScope t(kAtCompPool, stream);
                 dsv4_comp_ape_add_row_kernel<<<(unsigned) ((W + 255) / 256), 256, 0, stream>>>(
                     ws.score + (size_t) j * W, w.ape + (size_t) rem * W, W);
                 DSV4_CK(cudaGetLastError());
@@ -550,16 +560,19 @@ int64_t dsv4_comp_forward(const Dsv4CompWeights& w, Dsv4CompState& st, Dsv4CompW
                                         ws.score + (size_t) j * W, (size_t) W * 4,
                                         cudaMemcpyDeviceToDevice, stream));
             if (!should) continue;
-            if (chunk_prefill) {
-                dsv4_comp_pool_chunk_kernel<<<(unsigned) ((d + 255) / 256), 256, 0, stream>>>(
-                    st.kv_state, st.raw_state, w.ape, d, ratio, (int) coff,
-                    ws.kv_c + (size_t) emit_pos.size() * d);
-            } else {
-                dsv4_comp_pool_decode_kernel<<<(unsigned) ((d + 255) / 256), 256, 0, stream>>>(
-                    st.kv_state, st.score_state, d, ratio, (int) coff,
-                    ws.kv_c + (size_t) emit_pos.size() * d);
+            {
+                AttnTimeScope t(kAtCompPool, stream);
+                if (chunk_prefill) {
+                    dsv4_comp_pool_chunk_kernel<<<(unsigned) ((d + 255) / 256), 256, 0, stream>>>(
+                        st.kv_state, st.raw_state, w.ape, d, ratio, (int) coff,
+                        ws.kv_c + (size_t) emit_pos.size() * d);
+                } else {
+                    dsv4_comp_pool_decode_kernel<<<(unsigned) ((d + 255) / 256), 256, 0, stream>>>(
+                        st.kv_state, st.score_state, d, ratio, (int) coff,
+                        ws.kv_c + (size_t) emit_pos.size() * d);
+                }
+                DSV4_CK(cudaGetLastError());
             }
-            DSV4_CK(cudaGetLastError());
             if (overlap) {
                 // memmove(state, state + ratio*W, ratio*W) via staging (same-buffer D2D overlap is UB)
                 const size_t bytes = (size_t) (ratio * W) * 4;
@@ -582,29 +595,41 @@ int64_t dsv4_comp_forward(const Dsv4CompWeights& w, Dsv4CompState& st, Dsv4CompW
         // rmsnorm(norm) -> rope at each block's own phase -> its own out_cache slot
         for (int64_t b = 0; b < ncomp; ++b) {
             float* row = ws.kv_c + (size_t) b * d;
-            dsv4_rmsnorm_rope_rows(row, 1, (int) d, rope.half, 1, (int) ratio, rope,
-                                   emit_pos[(size_t) b], 0, w.norm, stream);
-            if (out_cache)
-                DSV4_CK(cudaMemcpyAsync(out_cache + (size_t) emit_slot[(size_t) b] * d, row,
-                                        (size_t) d * 4, cudaMemcpyDeviceToDevice, stream));
-            if (kv_out)
-                DSV4_CK(cudaMemcpyAsync(kv_out + (size_t) b * d, row, (size_t) d * 4,
-                                        cudaMemcpyDeviceToDevice, stream));
+            {
+                AttnTimeScope t(kAtNorm, stream);
+                dsv4_rmsnorm_rope_rows(row, 1, (int) d, rope.half, 1, (int) ratio, rope,
+                                       emit_pos[(size_t) b], 0, w.norm, stream);
+            }
+            if (out_cache || kv_out) {
+                AttnTimeScope t(kAtMem, stream);
+                if (out_cache)
+                    DSV4_CK(cudaMemcpyAsync(out_cache + (size_t) emit_slot[(size_t) b] * d, row,
+                                            (size_t) d * 4, cudaMemcpyDeviceToDevice, stream));
+                if (kv_out)
+                    DSV4_CK(cudaMemcpyAsync(kv_out + (size_t) b * d, row, (size_t) d * 4,
+                                            cudaMemcpyDeviceToDevice, stream));
+            }
         }
         return ncomp;
     }
 
     // rmsnorm(norm) -> rope at phase j*ratio (prefill) -> cache + kv_out
     // [S7e] norm + rope in one launch (bit-identical, see dsv4_rmsnorm_rope_kernel)
-    dsv4_rmsnorm_rope_rows(ws.kv_c, (int) ncomp, (int) d, rope.half, 1, (int) ratio, rope, 0,
-                           0, w.norm, stream);
-    if (out_cache) {
-        DSV4_CK(cudaMemcpyAsync(out_cache, ws.kv_c, (size_t) (ncomp * d) * 4,
-                                cudaMemcpyDeviceToDevice, stream));
+    {
+        AttnTimeScope t(kAtNorm, stream);
+        dsv4_rmsnorm_rope_rows(ws.kv_c, (int) ncomp, (int) d, rope.half, 1, (int) ratio, rope, 0,
+                               0, w.norm, stream);
     }
-    if (kv_out)
-        DSV4_CK(cudaMemcpyAsync(kv_out, ws.kv_c, (size_t) (ncomp * d) * 4,
-                                cudaMemcpyDeviceToDevice, stream));
+    {
+        AttnTimeScope t(kAtMem, stream);
+        if (out_cache) {
+            DSV4_CK(cudaMemcpyAsync(out_cache, ws.kv_c, (size_t) (ncomp * d) * 4,
+                                    cudaMemcpyDeviceToDevice, stream));
+        }
+        if (kv_out)
+            DSV4_CK(cudaMemcpyAsync(kv_out, ws.kv_c, (size_t) (ncomp * d) * 4,
+                                    cudaMemcpyDeviceToDevice, stream));
+    }
     return ncomp;
 }
 
@@ -897,36 +922,64 @@ bool dsv4_idx_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
     }
     // q path: gemm -> rmsnorm(q_norm) -> gemm -> per-head renorm -> rope (qr is shared with the indexer)
     // [S7c] gemms consume the warp-slice-transposed copies (bit-identical values)
-    dsv4_xpose1024_rows(x, aws.xt, s * kNEmbd, stream);
-    dsv4_gemm_q8_rows(w.wq_a, kQRank, kNEmbd, 0, aws.xt, (int) s, kNEmbd, aws.qr, stream);
-    dsv4_rmsnorm_rows(aws.qr, (int) s, kQRank, w.q_norm, stream);
-    dsv4_xpose1024_rows(aws.qr, aws.qr_t, s * kQRank, stream);
-    dsv4_gemm_q8_rows(w.wq_b, kNHead * kHeadDim, kQRank, 0, aws.qr_t, (int) s, kQRank, aws.q,
-                      stream);
-    dsv4_rmsnorm_rope_rows(aws.q, (int) s * kNHead, kHeadDim, rope.half, kNHead, 1, rope, start_pos,
-                           0, nullptr, stream);   // [S7e] norm + rope in one launch
+    {
+        AttnTimeScope t(kAtXpose, stream);
+        dsv4_xpose1024_rows(x, aws.xt, s * kNEmbd, stream);
+    }
+    {
+        AttnTimeScope t(kAtProj, stream);
+        dsv4_gemm_q8_rows(w.wq_a, kQRank, kNEmbd, 0, aws.xt, (int) s, kNEmbd, aws.qr, stream);
+    }
+    {
+        AttnTimeScope t(kAtNorm, stream);
+        dsv4_rmsnorm_rows(aws.qr, (int) s, kQRank, w.q_norm, stream);
+    }
+    {
+        AttnTimeScope t(kAtXpose, stream);
+        dsv4_xpose1024_rows(aws.qr, aws.qr_t, s * kQRank, stream);
+    }
+    {
+        AttnTimeScope t(kAtProj, stream);
+        dsv4_gemm_q8_rows(w.wq_b, kNHead * kHeadDim, kQRank, 0, aws.qr_t, (int) s, kQRank, aws.q,
+                          stream);
+    }
+    {
+        AttnTimeScope t(kAtNorm, stream);
+        dsv4_rmsnorm_rope_rows(aws.q, (int) s * kNHead, kHeadDim, rope.half, kNHead, 1, rope,
+                               start_pos, 0, nullptr, stream);  // [S7e] norm + rope in one launch
+    }
     // kv path: gemm -> rmsnorm(kv_norm) -> rope
-    dsv4_gemm_q8_rows(w.wkv, kHeadDim, kNEmbd, 0, aws.xt, (int) s, kNEmbd, aws.kv_new, stream);
-    dsv4_rmsnorm_rope_rows(aws.kv_new, (int) s, kHeadDim, rope.half, 1, 1, rope, start_pos, 0,
-                           w.kv_norm, stream);   // [S7e] norm + rope in one launch
+    {
+        AttnTimeScope t(kAtProj, stream);
+        dsv4_gemm_q8_rows(w.wkv, kHeadDim, kNEmbd, 0, aws.xt, (int) s, kNEmbd, aws.kv_new, stream);
+    }
+    {
+        AttnTimeScope t(kAtNorm, stream);
+        dsv4_rmsnorm_rope_rows(aws.kv_new, (int) s, kHeadDim, rope.half, 1, 1, rope, start_pos, 0,
+                               w.kv_norm, stream);  // [S7e] norm + rope in one launch
+    }
     // window part of the cache (S3/S4 semantics: prefill writes/ring-shifts, decode writes one slot)
-    if (start_pos == 0) {
-        if (s <= win) {
-            DSV4_CK(cudaMemcpyAsync(kv_cache, aws.kv_new, (size_t) (s * kHeadDim) * 4,
-                                    cudaMemcpyDeviceToDevice, stream));
-        } else {
-            DSV4_CK(cudaMemcpyAsync(aws.cache_tmp, kv_cache + (size_t) s * kHeadDim,
-                                    (size_t) ((win - s) * kHeadDim) * 4, cudaMemcpyDeviceToDevice,
-                                    stream));
-            DSV4_CK(cudaMemcpyAsync(kv_cache, aws.cache_tmp, (size_t) ((win - s) * kHeadDim) * 4,
-                                    cudaMemcpyDeviceToDevice, stream));
-            DSV4_CK(cudaMemcpyAsync(kv_cache + (size_t) (win - s) * kHeadDim, aws.kv_new,
-                                    (size_t) (s * kHeadDim) * 4, cudaMemcpyDeviceToDevice, stream));
+    {
+        AttnTimeScope t(kAtMem, stream);
+        if (start_pos == 0) {
+            if (s <= win) {
+                DSV4_CK(cudaMemcpyAsync(kv_cache, aws.kv_new, (size_t) (s * kHeadDim) * 4,
+                                        cudaMemcpyDeviceToDevice, stream));
+            } else {
+                DSV4_CK(cudaMemcpyAsync(aws.cache_tmp, kv_cache + (size_t) s * kHeadDim,
+                                        (size_t) ((win - s) * kHeadDim) * 4,
+                                        cudaMemcpyDeviceToDevice, stream));
+                DSV4_CK(cudaMemcpyAsync(kv_cache, aws.cache_tmp, (size_t) ((win - s) * kHeadDim) * 4,
+                                        cudaMemcpyDeviceToDevice, stream));
+                DSV4_CK(cudaMemcpyAsync(kv_cache + (size_t) (win - s) * kHeadDim, aws.kv_new,
+                                        (size_t) (s * kHeadDim) * 4, cudaMemcpyDeviceToDevice,
+                                        stream));
+            }
+        } else if (s == 1) {
+            // decode: the single new row lands at slot start_pos % win
+            DSV4_CK(cudaMemcpyAsync(kv_cache + (start_pos % win) * kHeadDim, aws.kv_new,
+                                    (size_t) kHeadDim * 4, cudaMemcpyDeviceToDevice, stream));
         }
-    } else if (s == 1) {
-        // decode: the single new row lands at slot start_pos % win
-        DSV4_CK(cudaMemcpyAsync(kv_cache + (start_pos % win) * kHeadDim, aws.kv_new,
-                                (size_t) kHeadDim * 4, cudaMemcpyDeviceToDevice, stream));
     }
     // [R-01] decode with s > 1: the ring slots are written PER ROW inside the attention loop below.
     // Writing all R rows up front is wrong once the batch reaches the ring: row j writes slot
@@ -943,6 +996,7 @@ bool dsv4_idx_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
     if (start_pos == 0) {
         offset = s;
         if (ncomp > 0) {
+            AttnTimeScope t(kAtMem, stream);
             DSV4_CK(cudaMemcpyAsync(cws.kv_all, aws.kv_new, (size_t) (s * kHeadDim) * 4,
                                     cudaMemcpyDeviceToDevice, stream));
             DSV4_CK(cudaMemcpyAsync(cws.kv_all + (size_t) s * kHeadDim,
@@ -961,18 +1015,27 @@ bool dsv4_idx_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
     const int64_t kv_slots = start_pos == 0 ? (ncomp > 0 ? s + ncomp : s) : (int64_t) win;
     // indexer q: gemm(indexer.attn_q_b) over the SHARED qr, rope at the token position, NO renorm
     // (dsv4ref :903-907)
-    dsv4_gemm_q8_rows(iw.wq_b, kIdxHeads * kIdxDim, kQRank, 0, aws.qr_t, (int) s, kQRank, iws.q,
-                      stream);
-    dsv4_rope_rows_mul(iws.q, (int) s * kIdxHeads, kIdxDim, rope.half, kIdxHeads, 1, rope, start_pos, 0,
-                       stream);
+    {
+        AttnTimeScope t(kAtProj, stream);
+        dsv4_gemm_q8_rows(iw.wq_b, kIdxHeads * kIdxDim, kQRank, 0, aws.qr_t, (int) s, kQRank, iws.q,
+                          stream);
+    }
+    {
+        AttnTimeScope t(kAtRope, stream);
+        dsv4_rope_rows_mul(iws.q, (int) s * kIdxHeads, kIdxDim, rope.half, kIdxHeads, 1, rope,
+                           start_pos, 0, stream);
+    }
     // indexer compressor: fp32 keys into the layer's indexer cache slice (own ratio-4/d-128/coff-2 state)
     dsv4_comp_forward(iw.comp, ist, cws, x, s, start_pos, rope, kRmsEps, idx_cache, nullptr, stream,
                       chunk_prefill);
     // weights: gemm(indexer.proj, raw BF16, double accumulation); the 128^-0.5 * 64^-0.5 scale is applied
     // on the host below, in dsv4ref's :919-921 order
-    dsv4_gemm_bf16_kernel<<<kIdxHeads, 128, 0, stream>>>(iw.proj, kIdxHeads, kNEmbd, x, (int) s,
-                                                         iws.wgt);
-    DSV4_CK(cudaGetLastError());
+    {
+        AttnTimeScope t(kAtIdx, stream);
+        dsv4_gemm_bf16_kernel<<<kIdxHeads, 128, 0, stream>>>(iw.proj, kIdxHeads, kNEmbd, x, (int) s,
+                                                             iws.wgt);
+        DSV4_CK(cudaGetLastError());
+    }
     // selection (EXACT top-512 contract, dsv4ref :895): device score + bitonic selection, no host round
     // trip and no stream sync.  The key order reproduces the host's stable descending sort (ties asc t)
     // and the score kernels are __fmul_rn/__fadd_rn ports of dsv4_idx_dot / the ascending-h sum.
@@ -983,6 +1046,7 @@ bool dsv4_idx_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
     const bool pad_kw = chunk_prefill && start_pos == 0 && s < win;
     const int64_t kw_cap = pad_kw ? win : (start_pos > 0 ? win : std::min<int64_t>(s, win));
     std::vector<int32_t> h_topk((size_t) (s * kw_cap), -1);
+    const auto t_tab0 = std::chrono::steady_clock::now();
     const int64_t kw = pad_kw ? dsv4_window_topk_pad(win, (int) s, h_topk.data())
                               : dsv4_window_topk(win, (int) s, start_pos, h_topk.data());
     int64_t kc = 0;
@@ -995,6 +1059,7 @@ bool dsv4_idx_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
         }
         const float wscale = static_cast<float>(1.0 / std::sqrt((double) kIdxDim) *
                                                 (1.0 / std::sqrt((double) kIdxHeads)));
+        AttnTimeScope t(kAtIdx, stream);
         dsv4_idx_dp_kernel<<<(unsigned) (s * nc), kIdxHeads, 0, stream>>>(
             iws.q, idx_cache, iws.dp, (int) s, (int) nc, kIdxHeads, kIdxDim);
         const int th = 256;
@@ -1033,37 +1098,55 @@ bool dsv4_idx_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
     }
     // window rows come from the host list, indexer rows from the device buffer; one 2-D copy each
     const int64_t K = kw + kc;
-    DSV4_CK(cudaMemcpy2DAsync(cws.topk, (size_t) K * 4, h_topk.data(), (size_t) kw_cap * 4,
-                              (size_t) kw * 4, (size_t) s, cudaMemcpyHostToDevice, stream));
-    if (kc > 0)
-        DSV4_CK(cudaMemcpy2DAsync((int32_t*) cws.topk + kw, (size_t) K * 4, iws.tk, (size_t) 512 * 4,
-                                  (size_t) kc * 4, (size_t) s, cudaMemcpyDeviceToDevice, stream));
+    attn_time_host_table(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                  t_tab0).count());
+    {
+        AttnTimeScope t(kAtTableH2D, stream);
+        DSV4_CK(cudaMemcpy2DAsync(cws.topk, (size_t) K * 4, h_topk.data(), (size_t) kw_cap * 4,
+                                  (size_t) kw * 4, (size_t) s, cudaMemcpyHostToDevice, stream));
+        if (kc > 0)
+            DSV4_CK(cudaMemcpy2DAsync((int32_t*) cws.topk + kw, (size_t) K * 4, iws.tk,
+                                      (size_t) 512 * 4, (size_t) kc * 4, (size_t) s,
+                                      cudaMemcpyDeviceToDevice, stream));
+    }
     // dense MQA-512 over the combined list, softmax scale 512^-0.5, sinks in the denominator only
     const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
-    if (start_pos > 0 && s > 1) {
-        // [G1] one launch per row: the kernel's row index is 0, so only the row's own table changes.
-        // [R-01] row j's ring slot is written immediately before row j's attention, so a later row's KV
-        // can never land in an earlier row's window (the correct pattern dsv4_attn.cu already uses).
-        for (int64_t j = 0; j < s; ++j) {
-            DSV4_CK(cudaMemcpyAsync(kv_cache + ((start_pos + j) % win) * kHeadDim,
-                                    aws.kv_new + j * kHeadDim, (size_t) kHeadDim * 4,
-                                    cudaMemcpyDeviceToDevice, stream));
-            dsv4_mqa512_rows(aws.q + j * kNHead * kHeadDim, kv_ptr, cws.topk + j * K, w.sinks, 1,
-                             (int) K, (int) (kv_slots + kc), scale,
-                             aws.attn + j * kNHead * kHeadDim, stream);
+    {
+        AttnTimeScope t(kAtMqa, stream);
+        if (start_pos > 0 && s > 1) {
+            // [G1] one launch per row: the kernel's row index is 0, so only the row's own table
+            // changes.  [R-01] row j's ring slot is written immediately before row j's attention, so a
+            // later row's KV can never land in an earlier row's window.
+            for (int64_t j = 0; j < s; ++j) {
+                DSV4_CK(cudaMemcpyAsync(kv_cache + ((start_pos + j) % win) * kHeadDim,
+                                        aws.kv_new + j * kHeadDim, (size_t) kHeadDim * 4,
+                                        cudaMemcpyDeviceToDevice, stream));
+                dsv4_mqa512_rows(aws.q + j * kNHead * kHeadDim, kv_ptr, cws.topk + j * K, w.sinks,
+                                 1, (int) K, (int) (kv_slots + kc), scale,
+                                 aws.attn + j * kNHead * kHeadDim, stream);
+            }
+        } else {
+            dsv4_mqa512_rows(aws.q, kv_ptr, cws.topk, w.sinks, (int) s, (int) K,
+                             (int) (kv_slots + kc), scale, aws.attn, stream);
         }
-    } else {
-        dsv4_mqa512_rows(aws.q, kv_ptr, cws.topk, w.sinks, (int) s, (int) K, (int) (kv_slots + kc),
-                         scale, aws.attn, stream);
     }
     // inverse rope on the attention output, then the grouped O projection
-    dsv4_rope_rows_mul(aws.attn, (int) s * kNHead, kHeadDim, rope.half, kNHead, 1, rope, start_pos, 1,
-                       stream);
+    {
+        AttnTimeScope t(kAtRope, stream);
+        dsv4_rope_rows_mul(aws.attn, (int) s * kNHead, kHeadDim, rope.half, kNHead, 1, rope,
+                           start_pos, 1, stream);
+    }
     // [S7c] wo_a reads the transposed attention output and writes o8k directly transposed for wo_b
-    dsv4_xpose1024_rows(aws.attn, aws.attn_t, s * kNHead * kHeadDim, stream);
-    dsv4_gemm_q8_rows(w.wo_a, kORows, kNEmbd, kOGroup, aws.attn_t, (int) s, kNHead * kHeadDim,
-                      aws.o8k, stream, 1);
-    dsv4_gemm_q8_rows(w.wo_b, kNEmbd, kORows, 0, aws.o8k, (int) s, kORows, out, stream);
+    {
+        AttnTimeScope t(kAtXpose, stream);
+        dsv4_xpose1024_rows(aws.attn, aws.attn_t, s * kNHead * kHeadDim, stream);
+    }
+    {
+        AttnTimeScope t(kAtProj, stream);
+        dsv4_gemm_q8_rows(w.wo_a, kORows, kNEmbd, kOGroup, aws.attn_t, (int) s, kNHead * kHeadDim,
+                          aws.o8k, stream, 1);
+        dsv4_gemm_q8_rows(w.wo_b, kNEmbd, kORows, 0, aws.o8k, (int) s, kORows, out, stream);
+    }
     return true;
 }
 
@@ -1094,36 +1177,64 @@ bool dsv4_comp_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope
     }
     // q path: gemm -> rmsnorm(q_norm) -> gemm -> per-head renorm -> rope (YaRN compress table)
     // [S7c] gemms consume the warp-slice-transposed copies (bit-identical values)
-    dsv4_xpose1024_rows(x, aws.xt, s * kNEmbd, stream);
-    dsv4_gemm_q8_rows(w.wq_a, kQRank, kNEmbd, 0, aws.xt, (int) s, kNEmbd, aws.qr, stream);
-    dsv4_rmsnorm_rows(aws.qr, (int) s, kQRank, w.q_norm, stream);
-    dsv4_xpose1024_rows(aws.qr, aws.qr_t, s * kQRank, stream);
-    dsv4_gemm_q8_rows(w.wq_b, kNHead * kHeadDim, kQRank, 0, aws.qr_t, (int) s, kQRank, aws.q,
-                      stream);
-    dsv4_rmsnorm_rope_rows(aws.q, (int) s * kNHead, kHeadDim, rope.half, kNHead, 1, rope, start_pos,
-                           0, nullptr, stream);   // [S7e] norm + rope in one launch
+    {
+        AttnTimeScope t(kAtXpose, stream);
+        dsv4_xpose1024_rows(x, aws.xt, s * kNEmbd, stream);
+    }
+    {
+        AttnTimeScope t(kAtProj, stream);
+        dsv4_gemm_q8_rows(w.wq_a, kQRank, kNEmbd, 0, aws.xt, (int) s, kNEmbd, aws.qr, stream);
+    }
+    {
+        AttnTimeScope t(kAtNorm, stream);
+        dsv4_rmsnorm_rows(aws.qr, (int) s, kQRank, w.q_norm, stream);
+    }
+    {
+        AttnTimeScope t(kAtXpose, stream);
+        dsv4_xpose1024_rows(aws.qr, aws.qr_t, s * kQRank, stream);
+    }
+    {
+        AttnTimeScope t(kAtProj, stream);
+        dsv4_gemm_q8_rows(w.wq_b, kNHead * kHeadDim, kQRank, 0, aws.qr_t, (int) s, kQRank, aws.q,
+                          stream);
+    }
+    {
+        AttnTimeScope t(kAtNorm, stream);
+        dsv4_rmsnorm_rope_rows(aws.q, (int) s * kNHead, kHeadDim, rope.half, kNHead, 1, rope,
+                               start_pos, 0, nullptr, stream);  // [S7e] norm + rope in one launch
+    }
     // kv path: gemm -> rmsnorm(kv_norm) -> rope
-    dsv4_gemm_q8_rows(w.wkv, kHeadDim, kNEmbd, 0, aws.xt, (int) s, kNEmbd, aws.kv_new, stream);
-    dsv4_rmsnorm_rope_rows(aws.kv_new, (int) s, kHeadDim, rope.half, 1, 1, rope, start_pos, 0,
-                           w.kv_norm, stream);   // [S7e] norm + rope in one launch
+    {
+        AttnTimeScope t(kAtProj, stream);
+        dsv4_gemm_q8_rows(w.wkv, kHeadDim, kNEmbd, 0, aws.xt, (int) s, kNEmbd, aws.kv_new, stream);
+    }
+    {
+        AttnTimeScope t(kAtNorm, stream);
+        dsv4_rmsnorm_rope_rows(aws.kv_new, (int) s, kHeadDim, rope.half, 1, 1, rope, start_pos, 0,
+                               w.kv_norm, stream);  // [S7e] norm + rope in one launch
+    }
     // window part of the cache (S3 semantics: prefill writes/ring-shifts, decode writes one slot)
-    if (start_pos == 0) {
-        if (s <= win) {
-            DSV4_CK(cudaMemcpyAsync(kv_cache, aws.kv_new, (size_t) (s * kHeadDim) * 4,
-                                    cudaMemcpyDeviceToDevice, stream));
-        } else {
-            DSV4_CK(cudaMemcpyAsync(aws.cache_tmp, kv_cache + (size_t) s * kHeadDim,
-                                    (size_t) ((win - s) * kHeadDim) * 4, cudaMemcpyDeviceToDevice,
-                                    stream));
-            DSV4_CK(cudaMemcpyAsync(kv_cache, aws.cache_tmp, (size_t) ((win - s) * kHeadDim) * 4,
-                                    cudaMemcpyDeviceToDevice, stream));
-            DSV4_CK(cudaMemcpyAsync(kv_cache + (size_t) (win - s) * kHeadDim, aws.kv_new,
-                                    (size_t) (s * kHeadDim) * 4, cudaMemcpyDeviceToDevice, stream));
+    {
+        AttnTimeScope t(kAtMem, stream);
+        if (start_pos == 0) {
+            if (s <= win) {
+                DSV4_CK(cudaMemcpyAsync(kv_cache, aws.kv_new, (size_t) (s * kHeadDim) * 4,
+                                        cudaMemcpyDeviceToDevice, stream));
+            } else {
+                DSV4_CK(cudaMemcpyAsync(aws.cache_tmp, kv_cache + (size_t) s * kHeadDim,
+                                        (size_t) ((win - s) * kHeadDim) * 4,
+                                        cudaMemcpyDeviceToDevice, stream));
+                DSV4_CK(cudaMemcpyAsync(kv_cache, aws.cache_tmp, (size_t) ((win - s) * kHeadDim) * 4,
+                                        cudaMemcpyDeviceToDevice, stream));
+                DSV4_CK(cudaMemcpyAsync(kv_cache + (size_t) (win - s) * kHeadDim, aws.kv_new,
+                                        (size_t) (s * kHeadDim) * 4, cudaMemcpyDeviceToDevice,
+                                        stream));
+            }
+        } else if (s == 1) {
+            // decode: the single new row lands at slot start_pos % win
+            DSV4_CK(cudaMemcpyAsync(kv_cache + (start_pos % win) * kHeadDim, aws.kv_new,
+                                    (size_t) kHeadDim * 4, cudaMemcpyDeviceToDevice, stream));
         }
-    } else if (s == 1) {
-        // decode: the single new row lands at slot start_pos % win
-        DSV4_CK(cudaMemcpyAsync(kv_cache + (start_pos % win) * kHeadDim, aws.kv_new,
-                                (size_t) kHeadDim * 4, cudaMemcpyDeviceToDevice, stream));
     }
     // [R-01] decode with s > 1: the ring slots are written PER ROW inside the attention loop below.
     // Writing all R rows up front is wrong once the batch reaches the ring: row j writes slot
@@ -1139,6 +1250,7 @@ bool dsv4_comp_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope
     if (start_pos == 0) {
         offset = s;
         if (ncomp > 0) {
+            AttnTimeScope t(kAtMem, stream);
             DSV4_CK(cudaMemcpyAsync(cws.kv_all, aws.kv_new, (size_t) (s * kHeadDim) * 4,
                                     cudaMemcpyDeviceToDevice, stream));
             DSV4_CK(cudaMemcpyAsync(cws.kv_all + (size_t) s * kHeadDim, cws.kv_c,
@@ -1163,6 +1275,7 @@ bool dsv4_comp_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope
     // for s == 1 this is the old (start_pos+1)/ratio.
     const int64_t kc_cap = (start_pos + s) / ratio;
     std::vector<int32_t> h_topk((size_t) (s * (kw_cap + kc_cap)));
+    const auto t_tab0 = std::chrono::steady_clock::now();
     const int64_t kw = pad_kw ? dsv4_window_topk_pad(win, (int) s, h_topk.data())
                               : dsv4_window_topk(win, (int) s, start_pos, h_topk.data());
     const int64_t kc =
@@ -1178,34 +1291,51 @@ bool dsv4_comp_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope
                         (size_t) kc * sizeof(int32_t));
     }
     const int64_t K = kw + kc;
-    DSV4_CK(cudaMemcpyAsync(cws.topk, h_dense.data(), (size_t) (s * K) * sizeof(int32_t),
-                            cudaMemcpyHostToDevice, stream));
+    attn_time_host_table(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                  t_tab0).count());
+    {
+        AttnTimeScope t(kAtTableH2D, stream);
+        DSV4_CK(cudaMemcpyAsync(cws.topk, h_dense.data(), (size_t) (s * K) * sizeof(int32_t),
+                                cudaMemcpyHostToDevice, stream));
+    }
     // dense MQA-512 over the combined list, softmax scale 512^-0.5, sinks in the denominator only
     const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
-    if (start_pos > 0 && s > 1) {
-        // [G1] one launch per row: the kernel's row index is 0, so only the row's own table changes.
-        // [R-01] row j's ring slot is written immediately before row j's attention, so a later row's KV
-        // can never land in an earlier row's window (the correct pattern dsv4_attn.cu already uses).
-        for (int64_t j = 0; j < s; ++j) {
-            DSV4_CK(cudaMemcpyAsync(kv_cache + ((start_pos + j) % win) * kHeadDim,
-                                    aws.kv_new + j * kHeadDim, (size_t) kHeadDim * 4,
-                                    cudaMemcpyDeviceToDevice, stream));
-            dsv4_mqa512_rows(aws.q + j * kNHead * kHeadDim, kv_ptr, cws.topk + j * K, w.sinks, 1,
-                             (int) K, (int) (kv_slots + kc), scale,
-                             aws.attn + j * kNHead * kHeadDim, stream);
+    {
+        AttnTimeScope t(kAtMqa, stream);
+        if (start_pos > 0 && s > 1) {
+            // [G1] one launch per row: the kernel's row index is 0, so only the row's own table
+            // changes.  [R-01] row j's ring slot is written immediately before row j's attention, so a
+            // later row's KV can never land in an earlier row's window.
+            for (int64_t j = 0; j < s; ++j) {
+                DSV4_CK(cudaMemcpyAsync(kv_cache + ((start_pos + j) % win) * kHeadDim,
+                                        aws.kv_new + j * kHeadDim, (size_t) kHeadDim * 4,
+                                        cudaMemcpyDeviceToDevice, stream));
+                dsv4_mqa512_rows(aws.q + j * kNHead * kHeadDim, kv_ptr, cws.topk + j * K, w.sinks,
+                                 1, (int) K, (int) (kv_slots + kc), scale,
+                                 aws.attn + j * kNHead * kHeadDim, stream);
+            }
+        } else {
+            dsv4_mqa512_rows(aws.q, kv_ptr, cws.topk, w.sinks, (int) s, (int) K,
+                             (int) (kv_slots + kc), scale, aws.attn, stream);
         }
-    } else {
-        dsv4_mqa512_rows(aws.q, kv_ptr, cws.topk, w.sinks, (int) s, (int) K, (int) (kv_slots + kc),
-                         scale, aws.attn, stream);
     }
     // inverse rope on the attention output, then the grouped O projection
-    dsv4_rope_rows_mul(aws.attn, (int) s * kNHead, kHeadDim, rope.half, kNHead, 1, rope, start_pos, 1,
-                       stream);
+    {
+        AttnTimeScope t(kAtRope, stream);
+        dsv4_rope_rows_mul(aws.attn, (int) s * kNHead, kHeadDim, rope.half, kNHead, 1, rope,
+                           start_pos, 1, stream);
+    }
     // [S7c] wo_a reads the transposed attention output and writes o8k directly transposed for wo_b
-    dsv4_xpose1024_rows(aws.attn, aws.attn_t, s * kNHead * kHeadDim, stream);
-    dsv4_gemm_q8_rows(w.wo_a, kORows, kNEmbd, kOGroup, aws.attn_t, (int) s, kNHead * kHeadDim,
-                      aws.o8k, stream, 1);
-    dsv4_gemm_q8_rows(w.wo_b, kNEmbd, kORows, 0, aws.o8k, (int) s, kORows, out, stream);
+    {
+        AttnTimeScope t(kAtXpose, stream);
+        dsv4_xpose1024_rows(aws.attn, aws.attn_t, s * kNHead * kHeadDim, stream);
+    }
+    {
+        AttnTimeScope t(kAtProj, stream);
+        dsv4_gemm_q8_rows(w.wo_a, kORows, kNEmbd, kOGroup, aws.attn_t, (int) s, kNHead * kHeadDim,
+                          aws.o8k, stream, 1);
+        dsv4_gemm_q8_rows(w.wo_b, kNEmbd, kORows, 0, aws.o8k, (int) s, kORows, out, stream);
+    }
     // compared token by token (filename carries the pass ordinal: p0 = start_pos 0, p1 = later).
     return true;
 }
@@ -1220,6 +1350,7 @@ bool dsv4_attn_half(const Dsv4Geometry& g, int64_t layer, const Dsv4AttnHalfWeig
                     cudaStream_t stream, std::string& err, bool chunk_prefill) {
     const int64_t N = g.n_embd;
     const int64_t ratio = dsv4_compress_ratio(layer);
+    attn_time_set_class(ratio == 0 ? kAtHash : (ratio == 128 ? kAtR128 : kAtIdxLayer));
     if (s > cws.max_s || s > iws.max_s) {
         err = "dsv4_attn_half: workspace undersized for s=" + std::to_string(s);
         return false;
@@ -1229,13 +1360,19 @@ bool dsv4_attn_half(const Dsv4Geometry& g, int64_t layer, const Dsv4AttnHalfWeig
         return false;
     }
     // hc_pre (attn side) -> rmsnorm(attn_norm): y is the attention block input
-    dsv4_comp_hc_mix_kernel<<<dim3((unsigned) s, 24), 256, 0, stream>>>(d_h, w.hc_fn, N, g.rms_eps,
-                                                                          cws.mixes);
-    dsv4_comp_hc_fin_kernel<<<(unsigned) s, 256, 0, stream>>>(d_h, w.hc_base, w.hc_scale, cws.mixes,
-                                                              N, g.hc_eps, cws.y, cws.post,
-                                                              cws.comb);
-    DSV4_CK(cudaGetLastError());
-    dsv4_rmsnorm_rows(cws.y, (int) s, (int) N, w.attn_norm, stream);
+    {
+        AttnTimeScope t(kAtHc, stream);
+        dsv4_comp_hc_mix_kernel<<<dim3((unsigned) s, 24), 256, 0, stream>>>(d_h, w.hc_fn, N,
+                                                                             g.rms_eps, cws.mixes);
+        dsv4_comp_hc_fin_kernel<<<(unsigned) s, 256, 0, stream>>>(d_h, w.hc_base, w.hc_scale,
+                                                                  cws.mixes, N, g.hc_eps, cws.y,
+                                                                  cws.post, cws.comb);
+        DSV4_CK(cudaGetLastError());
+    }
+    {
+        AttnTimeScope t(kAtNorm, stream);
+        dsv4_rmsnorm_rows(cws.y, (int) s, (int) N, w.attn_norm, stream);
+    }
     if (ratio == 0) {
         // hash layers 0/1: dense MLA over the window cache, plain rope (theta 1e4)
         if (!dsv4_attn_forward(w.attn, rope_plain, aws, cws.y, cws.bout, kv_cache, (int) s, start_pos,
@@ -1264,10 +1401,17 @@ bool dsv4_attn_half(const Dsv4Geometry& g, int64_t layer, const Dsv4AttnHalfWeig
         }
     }
     // hc_post into staging, then back over h
-    dsv4_comp_hc_post_kernel<<<(unsigned) s, 256, 0, stream>>>(d_h, cws.bout, cws.post, cws.comb, N,
-                                                               cws.h2);
-    DSV4_CK(cudaGetLastError());
-    DSV4_CK(cudaMemcpyAsync(d_h, cws.h2, (size_t) (s * 4 * N) * 4, cudaMemcpyDeviceToDevice, stream));
+    {
+        AttnTimeScope t(kAtHc, stream);
+        dsv4_comp_hc_post_kernel<<<(unsigned) s, 256, 0, stream>>>(d_h, cws.bout, cws.post, cws.comb,
+                                                                   N, cws.h2);
+        DSV4_CK(cudaGetLastError());
+    }
+    {
+        AttnTimeScope t(kAtMem, stream);
+        DSV4_CK(cudaMemcpyAsync(d_h, cws.h2, (size_t) (s * 4 * N) * 4, cudaMemcpyDeviceToDevice,
+                                stream));
+    }
     return true;
 }
 

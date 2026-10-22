@@ -46,6 +46,8 @@
 #include <sys/mman.h>
 #endif
 
+#include "dsv4_attn_time.h"
+
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/artifact/model_family.hpp"
 #include "strata/core/expert_source.hpp"
@@ -1705,6 +1707,7 @@ int strata::dsv4::run(int argc, char** argv) {
         }
     } else if (o.serve || o.have_tokens)
         std::fprintf(stderr, "strata-dsv4: S0 loads and reports only; generation arrives with S1-S7\n");
+    attn_time_flush();
     std::fprintf(stderr, "strata-dsv4: %s OK, exiting clean\n", o.forward ? "S5 forward" : "S0 load");
     return 0;
 }
