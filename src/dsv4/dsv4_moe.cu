@@ -421,6 +421,114 @@ __global__ void dsv4_nvfp4_gemv_grouped_kernel(const uint8_t* const* __restrict_
 }
 
 // ---------------------------------------------------------------------------
+// [M2] The same GEMV with the weight staging hoisted out of the token loop (STRATA_DSV4_MOE_REUSE=1).
+//
+// The R=1 kernel above is launched with grid.y = one block per (token, expert) entry, so every token
+// an expert serves re-stages the same 9216 B of weights from HBM into shared: at chunk 128 an expert
+// carries ~8.7 entries and each block stages 4 output rows of it, so the expert's full matrix is read
+// ~8.7 times per layer instead of once.
+//
+// The staged bytes `blobs[z] + role_off + (blockIdx.x*rpb)*(tpr*36)` do not depend on blockIdx.y, so
+// one block can serve ENT entries of its group with a single stage.  Bit-exactness is structural, not
+// statistical: the token loop wraps the *same* per-lane 32-code/4-scale chain in the *same* s,j order,
+// the *same* shfl tree and part[] reduction, and the *same* single tail-scale multiply - no value is
+// re-associated, nothing is summed across tokens, and each output element's K accumulation is still
+// one serial fp32 chain of the same length.  Reusing a staged byte cannot change a product.
+template <int ENT>
+__global__ void dsv4_nvfp4_gemv_grouped_reuse_kernel(const uint8_t* const* __restrict__ blobs,
+                                                     int64_t role_off, int64_t tail_off, int s2i,
+                                                     const float* __restrict__ xbase, int64_t xstride,
+                                                     const int32_t* __restrict__ xidx,
+                                                     const int32_t* __restrict__ ebase, int cols, int rows,
+                                                     float* __restrict__ y) {
+    extern __shared__ uint8_t sw[];
+    const int z = blockIdx.z;
+    const int cnt = (int) (ebase[z + 1] - ebase[z]);
+    const int y0 = (int) blockIdx.y * ENT;
+    if (y0 >= cnt) return;                       // padded y slot: this block owns no entry
+    const int nent = (ENT < cnt - y0) ? ENT : (cnt - y0);
+    const int64_t m0 = (int64_t) ebase[z] + y0;
+    const int tpr = cols >> 6;                  // threads per row: 64 or 32
+    const int rpb = 256 / tpr;                  // rows per block: 4 or 8
+    const int rloc = threadIdx.x / tpr;
+    const int lane = threadIdx.x % tpr;
+    const int row = blockIdx.x * rpb + rloc;
+    const int c31 = lane & 31;
+    {
+        const uint4* wv = reinterpret_cast<const uint4*>(blobs[z] + role_off +
+                                                         (int64_t) (blockIdx.x * rpb) * (tpr * 36));
+        uint4* dstv = reinterpret_cast<uint4*>(sw);
+        const int v = threadIdx.x;
+        const uint4 a = wv[v];
+        uint4 b, c;
+        if (v + 256 < 576) b = wv[v + 256];
+        if (v + 512 < 576) c = wv[v + 512];
+        dstv[v] = a;
+        if (v + 256 < 576) dstv[v + 256] = b;
+        if (v + 512 < 576) dstv[v + 512] = c;
+    }
+    __syncthreads();
+    const uint8_t* blk = sw + ((int64_t) rloc * tpr + lane) * 36;
+    const float d[4] = {dsv4_ue4m3(blk[0]), dsv4_ue4m3(blk[1]), dsv4_ue4m3(blk[2]), dsv4_ue4m3(blk[3])};
+    const uint32_t* qw = reinterpret_cast<const uint32_t*>(blk + 4);
+    uint32_t qv[8];
+#pragma unroll
+    for (int v = 0; v < 8; ++v) qv[v] = qw[v];
+    __shared__ float part[8][2];
+    const bool live = row < rows;               // uniform per warp for both tpr values (grids are exact)
+    for (int j = 0; j < nent; ++j) {
+        const int64_t m = m0 + j;
+        float acc = 0.f;
+        if (live) {
+            const float4* xv = reinterpret_cast<const float4*>(
+                xbase + (xidx ? (int64_t) xidx[m] : m) * xstride + (int64_t) (lane >> 5) * 2048);
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                const float dv = d[s];
+                float4 xs[4];
+#pragma unroll
+                for (int v = 0; v < 4; ++v) xs[v] = xv[(s * 4 + v) * 32 + c31];
+#pragma unroll
+                for (int jj = 0; jj < 8; ++jj) {
+                    const uint32_t byte = (qv[s * 2 + (jj >> 2)] >> ((jj & 3) * 8)) & 0xffu;
+                    const float4 xa = xs[jj >> 2];
+                    const float xj = (jj & 2) ? ((jj & 1) ? xa.w : xa.z) : ((jj & 1) ? xa.y : xa.x);
+                    const float4 xb = xs[2 + (jj >> 2)];
+                    const float xj8 = (jj & 2) ? ((jj & 1) ? xb.w : xb.z) : ((jj & 1) ? xb.y : xb.x);
+                    acc += dsv4_fp4_dec(byte & 0x0f) * dv * xj;
+                    acc += dsv4_fp4_dec(byte >> 4) * dv * xj8;
+                }
+            }
+            for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+            if ((lane & 31) == 0) part[rloc][lane >> 5] = acc;
+        }
+        __syncthreads();
+        if (live && lane == 0) {
+            float total = part[rloc][0];
+            if (tpr == 64) total += part[rloc][1];
+            const float s2 = tail_off ? ((const float*) (blobs[z] + tail_off))[s2i] : 1.0f;
+            y[m * rows + row] = total * s2;
+        }
+        __syncthreads();
+    }
+}
+
+// Host-side dispatch: ENT = 1 is the untouched R=1 kernel (default); ENT = 16 is the reuse kernel.
+static inline void dsv4_gemv_grouped_launch(const uint8_t* const* blobs, int64_t role_off, int64_t tail_off,
+                                            int s2i, const float* x, int64_t xstride, const int32_t* xidx,
+                                            const int32_t* ebase, int cols, int rows, float* y, unsigned gx,
+                                            int64_t max_m, int64_t nz, int ent, cudaStream_t st) {
+    if (ent > 1) {
+        const unsigned gy = (unsigned) ((max_m + ent - 1) / ent);
+        dsv4_nvfp4_gemv_grouped_reuse_kernel<16><<<dim3(gx, gy, (unsigned) nz), 256, 9216, st>>>(
+            blobs, role_off, tail_off, s2i, x, xstride, xidx, ebase, cols, rows, y);
+    } else {
+        dsv4_nvfp4_gemv_grouped_kernel<<<dim3(gx, (unsigned) max_m, (unsigned) nz), 256, 9216, st>>>(
+            blobs, role_off, tail_off, s2i, x, xstride, xidx, ebase, cols, rows, y);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The E2 V4 swiglu clamp variant (dsv4ref.cpp:1104-1113): h = silu(min(g, 10)) * clamp(u, -10, 10), the
 // router weight (when given) multiplied into the hidden BEFORE the down projection (trap 15).  One block
 // per batch item.
@@ -2096,6 +2204,9 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
         }
         const unsigned gu_blocks = (unsigned) (inter / (256 / (n / 64)));        // 2048 / 4
         const unsigned d_blocks = (unsigned) (n / (256 / (inter / 64)));         // 4096 / 8
+        // [M2] entries per block in the grouped GEMV: 1 = the R=1 kernel (default, unchanged),
+        // 16 = one weight stage reused by up to 16 tokens (STRATA_DSV4_MOE_REUSE=1).
+        const int moe_reuse = dsv4_ablit("STRATA_DSV4_MOE_REUSE") ? 16 : 1;
         const uint64_t blob_bytes = (uint64_t) lay.blob_bytes(layer);
         const bool peer_on = ws->cache[0] != nullptr && ws->cache[1] != nullptr && ws->peer.active;
         // [S10] read the layer's missing blobs into pinned slots before the admission loops, which can
@@ -2295,21 +2406,16 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             const int32_t* p_ebase = (const int32_t*) (p.tab + po_e);
             const int32_t* p_tok = (const int32_t*) (p.tab + po_t);
             const float* p_pw = (const float*) (p.tab + po_w);
-            const dim3 gu_grid1(gu_blocks, (unsigned) max_m1, (unsigned) u1);
-            const dim3 d_grid1(d_blocks, (unsigned) max_m1, (unsigned) u1);
             if (!dsv4_ablit("STRATA_ABL_NOGEMV")) {
-                dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid1, 256, 9216, p.stream>>>(
-                    p_ptrs, 0, (int64_t) fmt.tail_off, 0, p.y1, n, p_tok, p_ebase, (int) n, (int) inter,
-                    p.gate);
-                dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid1, 256, 9216, p.stream>>>(
-                    p_ptrs, (int64_t) fmt.up_off, (int64_t) fmt.tail_off, 1, p.y1, n, p_tok, p_ebase,
-                    (int) n, (int) inter, p.up);
+                dsv4_gemv_grouped_launch(p_ptrs, 0, (int64_t) fmt.tail_off, 0, p.y1, n, p_tok, p_ebase, (int) n, (int) inter, p.gate, gu_blocks,
+                                         max_m1, u1, moe_reuse, p.stream);
+                dsv4_gemv_grouped_launch(p_ptrs, (int64_t) fmt.up_off, (int64_t) fmt.tail_off, 1, p.y1, n, p_tok, p_ebase, (int) n, (int) inter, p.up,
+                                         gu_blocks, max_m1, u1, moe_reuse, p.stream);
                 dsv4_swiglu_clamp_kernel<<<(unsigned) entries1, 256, 0, p.stream>>>(p.gate, p.up, p_pw,
                                                                                      (int) inter, p.ph,
                                                                                      1);
-                dsv4_nvfp4_gemv_grouped_kernel<<<d_grid1, 256, 9216, p.stream>>>(
-                    p_ptrs, (int64_t) fmt.down_off, (int64_t) fmt.tail_off, 2, p.ph, inter, nullptr,
-                    p_ebase, (int) inter, (int) n, p.pout);
+                dsv4_gemv_grouped_launch(p_ptrs, (int64_t) fmt.down_off, (int64_t) fmt.tail_off, 2, p.ph, inter, nullptr, p_ebase, (int) inter, (int)
+                                         n, p.pout, d_blocks, max_m1, u1, moe_reuse, p.stream);
             }
             CKM(cudaGetLastError());
             CKM(cudaEventRecord(p.ev_done, p.stream));
@@ -2448,8 +2554,6 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             const int32_t* k_tok = (const int32_t*) (ws->tab + o_t);
             const float* k_pw = (const float*) (ws->tab + o_w);
             const int32_t* k_slot = (const int32_t*) (ws->tab + o_s);
-            const dim3 gu_grid(gu_blocks, (unsigned) max_m, (unsigned) n_groups);
-            const dim3 d_grid(d_blocks, (unsigned) max_m, (unsigned) n_groups);
             int mt_pfw = -1;
             if (g_moe_time.on) mt_pfw = g_moe_time.begin(kMhPfWait, stream);
             if (pf_on && ws->pf.ev[0] != nullptr) (void) cudaStreamWaitEvent(stream, ws->pf.ev[0], 0);
@@ -2457,20 +2561,17 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             if (!dsv4_ablit("STRATA_ABL_NOGEMV")) {
                 int mt_w[5] = {-1, -1, -1, -1, -1};
                 if (g_moe_time.on) mt_w[0] = g_moe_time.begin(kMhGateW, stream);
-                dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid, 256, 9216, stream>>>(
-                    k_ptrs, 0, (int64_t) fmt.tail_off, 0, ws->yt, n, k_tok, k_ebase, (int) n, (int) inter,
-                    ws->gate);
+                dsv4_gemv_grouped_launch(k_ptrs, 0, (int64_t) fmt.tail_off, 0, ws->yt, n, k_tok, k_ebase, (int) n, (int) inter, ws->gate, gu_blocks,
+                                         max_m, n_groups, moe_reuse, stream);
                 if (g_moe_time.on) { g_moe_time.end(mt_w[0], stream); mt_w[1] = g_moe_time.begin(kMhUpW, stream); }
-                dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid, 256, 9216, stream>>>(
-                    k_ptrs, (int64_t) fmt.up_off, (int64_t) fmt.tail_off, 1, ws->yt, n, k_tok, k_ebase,
-                    (int) n, (int) inter, ws->up);
+                dsv4_gemv_grouped_launch(k_ptrs, (int64_t) fmt.up_off, (int64_t) fmt.tail_off, 1, ws->yt, n, k_tok, k_ebase, (int) n, (int) inter,
+                                         ws->up, gu_blocks, max_m, n_groups, moe_reuse, stream);
                 if (g_moe_time.on) { g_moe_time.end(mt_w[1], stream); mt_w[2] = g_moe_time.begin(kMhSwiglu, stream); }
                 dsv4_swiglu_clamp_kernel<<<(unsigned) entries, 256, 0, stream>>>(ws->gate, ws->up, k_pw,
                                                                                  (int) inter, ws->ph, 1);
                 if (g_moe_time.on) { g_moe_time.end(mt_w[2], stream); mt_w[3] = g_moe_time.begin(kMhDownW, stream); }
-                dsv4_nvfp4_gemv_grouped_kernel<<<d_grid, 256, 9216, stream>>>(
-                    k_ptrs, (int64_t) fmt.down_off, (int64_t) fmt.tail_off, 2, ws->ph, inter, nullptr,
-                    k_ebase, (int) inter, (int) n, ws->pout);
+                dsv4_gemv_grouped_launch(k_ptrs, (int64_t) fmt.down_off, (int64_t) fmt.tail_off, 2, ws->ph, inter, nullptr, k_ebase, (int) inter, (int)
+                                         n, ws->pout, d_blocks, max_m, n_groups, moe_reuse, stream);
                 if (g_moe_time.on) { g_moe_time.end(mt_w[3], stream); mt_w[4] = g_moe_time.begin(kMhScatter, stream); }
                 dsv4_scatter_rows_kernel<<<(unsigned) entries, 256, 0, stream>>>(ws->pout, k_slot,
                                                                                 ws->comb6, n);
@@ -2607,25 +2708,20 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             const int32_t* k_tok = (const int32_t*) (ws->tab + o_t);
             const float* k_pw = (const float*) (ws->tab + o_w);
             const int32_t* k_slot = (const int32_t*) (ws->tab + o_s);
-            const dim3 gu_grid(gu_blocks, (unsigned) max_m, (unsigned) u);
-            const dim3 d_grid(d_blocks, (unsigned) max_m, (unsigned) u);
             if (!dsv4_ablit("STRATA_ABL_NOGEMV")) {
                 int mt_w[5] = {-1, -1, -1, -1, -1};
                 if (g_moe_time.on) mt_w[0] = g_moe_time.begin(kMhGateW, stream);
-                dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid, 256, 9216, stream>>>(
-                    k_ptrs, 0, (int64_t) fmt.tail_off, 0, ws->yt, n, k_tok, k_ebase, (int) n, (int) inter,
-                    ws->gate);
+                dsv4_gemv_grouped_launch(k_ptrs, 0, (int64_t) fmt.tail_off, 0, ws->yt, n, k_tok, k_ebase, (int) n, (int) inter, ws->gate, gu_blocks,
+                                         max_m, u, moe_reuse, stream);
                 if (g_moe_time.on) { g_moe_time.end(mt_w[0], stream); mt_w[1] = g_moe_time.begin(kMhUpW, stream); }
-                dsv4_nvfp4_gemv_grouped_kernel<<<gu_grid, 256, 9216, stream>>>(
-                    k_ptrs, (int64_t) fmt.up_off, (int64_t) fmt.tail_off, 1, ws->yt, n, k_tok, k_ebase,
-                    (int) n, (int) inter, ws->up);
+                dsv4_gemv_grouped_launch(k_ptrs, (int64_t) fmt.up_off, (int64_t) fmt.tail_off, 1, ws->yt, n, k_tok, k_ebase, (int) n, (int) inter,
+                                         ws->up, gu_blocks, max_m, u, moe_reuse, stream);
                 if (g_moe_time.on) { g_moe_time.end(mt_w[1], stream); mt_w[2] = g_moe_time.begin(kMhSwiglu, stream); }
                 dsv4_swiglu_clamp_kernel<<<(unsigned) entries, 256, 0, stream>>>(ws->gate, ws->up, k_pw,
                                                                                  (int) inter, ws->ph, 1);
                 if (g_moe_time.on) { g_moe_time.end(mt_w[2], stream); mt_w[3] = g_moe_time.begin(kMhDownW, stream); }
-                dsv4_nvfp4_gemv_grouped_kernel<<<d_grid, 256, 9216, stream>>>(
-                    k_ptrs, (int64_t) fmt.down_off, (int64_t) fmt.tail_off, 2, ws->ph, inter, nullptr,
-                    k_ebase, (int) inter, (int) n, ws->pout);
+                dsv4_gemv_grouped_launch(k_ptrs, (int64_t) fmt.down_off, (int64_t) fmt.tail_off, 2, ws->ph, inter, nullptr, k_ebase, (int) inter, (int)
+                                         n, ws->pout, d_blocks, max_m, u, moe_reuse, stream);
                 if (g_moe_time.on) { g_moe_time.end(mt_w[3], stream); mt_w[4] = g_moe_time.begin(kMhScatter, stream); }
                 dsv4_scatter_rows_kernel<<<(unsigned) entries, 256, 0, stream>>>(ws->pout, k_slot,
                                                                                 ws->comb6, n);
