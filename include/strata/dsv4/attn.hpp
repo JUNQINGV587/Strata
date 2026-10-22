@@ -130,4 +130,40 @@ void dsv4_rope_rows_mul(float* x, int rows, int width, int half, int rows_per_to
 void dsv4_mqa512_rows(const float* q, const float* kv, const int32_t* topk, const float* sinks, int s,
                       int K, int slots, float scale, float* out, cudaStream_t stream);
 
+// ---------------------------------------------------------------------------
+// [M2] batched prefill attention (STRATA_DSV4_ATTN_BATCH=1, default off).
+//
+// A chunked-prefill pass runs 128 rows through the same attention block, and the default path launches
+// one MQA-512 grid per row (kNHead blocks = 4 % of the SMs) after uploading a host-built topk table and
+// copying that row's 2 KB KV slice into the ring.  The batched path keeps the per-row numerics exactly
+// - each row still accumulates its K list in the same order, in the same 128-thread structure - and
+// only batches the "row" dimension: one launch for all s rows, tables built on the device, and the ring
+// written after the launch instead of per row.
+// ---------------------------------------------------------------------------
+
+// True when STRATA_DSV4_ATTN_BATCH selects the batched path (read once, cached).
+bool dsv4_attn_batch_enabled();
+
+// Device twin of dsv4_window_topk / dsv4_window_topk_pad: `stride` is the row pitch in entries, `nent`
+// the number of entries written per row (values outside the window are -1).  Same values as the host
+// builders by construction.
+void dsv4_window_topk_dev(int win, int s, int64_t start_pos, int stride, int nent, int32_t* topk,
+                          cudaStream_t stream);
+
+// Device twin of the start_pos > 0 branch of dsv4_compress_topk: writes the `kc` compressed-slot
+// columns at [kw, kw + kc) of each `stride`-pitch row (t + offset while t < (start_pos + j + 1)/ratio,
+// else -1).  The r=4 indexer block is NOT built here - its order comes from the selection kernel and
+// stays a device-to-device copy.
+void dsv4_compress_topk_dev(int64_t ratio, int s, int64_t start_pos, int64_t offset, int kw, int kc,
+                            int stride, int32_t* topk, cudaStream_t stream);
+
+// Row-batched MQA-512 for start_pos > 0, where the table is a pass-relative ring list: a window entry
+// (< win) resolves to this pass's kv_new row when that row is at or before the attending row's own
+// position, everything else (older ring slots and the compressed slots at >= win) reads kv_ring.  The
+// caller must therefore write the pass's KV rows into the ring AFTER this launch: writing them first
+// would expose a future row's KV to an earlier row ([R-01]), which the per-row default path avoids.
+void dsv4_mqa512_rows_ring(const float* q, const float* kv_new, const float* kv_ring,
+                           const int32_t* topk, const float* sinks, int s, int K, int slots, int win,
+                           int64_t start_pos, float scale, float* out, cudaStream_t stream);
+
 }  // namespace strata::dsv4

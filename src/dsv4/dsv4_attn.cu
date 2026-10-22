@@ -428,10 +428,30 @@ __global__ void dsv4_rmsnorm_rope_kernel(float* x, int rows, int cols, int half,
 // [R8] slots is the number of rows readable from kv for this launch (window rows, prefill rows, or
 // window + compressed rows).  A table entry outside [0, slots) is treated exactly like -1 (masked), so a
 // stale or corrupted index can never read past the end of the KV arena.
+// [M2] source of one table entry.  kRing == 0: the table indexes `kv` directly (prefill rows in kv_new
+// or in the staged kv_all).  kRing == 1: the table is the pass-relative ring list of
+// dsv4_window_topk's start_pos > 0 branch, so a window slot (< win) is this pass's kv_new row when that
+// row sits at or before the attending row's position, and an older ring slot otherwise; the compressed
+// slots (>= win) live behind the window and always read the ring.  Only the pointer differs - the
+// accumulate order inside the score and value loops is untouched.
+template <int kRing>
+__device__ __forceinline__ const float* dsv4_mqa512_src(const float* kv, const float* kv_new,
+                                                        int32_t tidx, int j, int hd, int win,
+                                                        int sp0) {
+    if (kRing != 0 && tidx < win) {
+        int d = tidx - sp0;
+        if (d < 0) d += win;
+        if (d <= j) return kv_new + (size_t) d * hd;  // row d of this pass; d <= j, never a future row
+    }
+    return kv + (size_t) tidx * hd;
+}
+
+template <int kRing>
 __global__ void dsv4_mqa512_kernel(const float* __restrict__ q, const float* __restrict__ kv,
+                                   const float* __restrict__ kv_new,
                                    const int32_t* __restrict__ topk,
                                    const float* __restrict__ sinks, int nh, int hd, int K, int slots,
-                                   float scale, float* __restrict__ out) {
+                                   int win, int sp0, float scale, float* __restrict__ out) {
     extern __shared__ float smem[];  // q_sh[hd] then scores[K]
     float* q_sh = smem;
     float* scores = smem + hd;
@@ -450,7 +470,7 @@ __global__ void dsv4_mqa512_kernel(const float* __restrict__ q, const float* __r
         const int32_t tidx = topk[(size_t)j * K + k];
         float sc = -INFINITY;
         if (tidx >= 0 && (unsigned) tidx < (unsigned) slots) {   // [R8] upper bound, not just >= 0
-            const float* kvr = kv + (size_t)tidx * hd;
+            const float* kvr = dsv4_mqa512_src<kRing>(kv, kv_new, tidx, j, hd, win, sp0);
             float acc = 0.f;
             for (int i = lane; i < hd; i += 32) acc += q_sh[i] * kvr[i];
 #pragma unroll
@@ -501,7 +521,7 @@ __global__ void dsv4_mqa512_kernel(const float* __restrict__ q, const float* __r
             if (e > 0.f) {
                 const int32_t tidx = topk[(size_t)j * K + k];
                 if ((unsigned) tidx < (unsigned) slots)   // [R8] same bound as the score pass
-                    acc += e * kv[(size_t)tidx * hd + i];
+                    acc += e * dsv4_mqa512_src<kRing>(kv, kv_new, tidx, j, hd, win, sp0)[i];
             }
         }
         oh[i] = acc * inv_denom;
@@ -907,10 +927,70 @@ void mqa512(const float* q, const float* kv, const int32_t* topk, const float* s
             int slots, float scale, float* out, cudaStream_t stream) {
     const size_t smem = (size_t)(kHeadDim + K) * 4;
     g_q8time.begin(7, stream);
-    dsv4_mqa512_kernel<<<s * kNHead, 128, smem, stream>>>(q, kv, topk, sinks, kNHead, kHeadDim, K,
-                                                          slots, scale, out);
+    dsv4_mqa512_kernel<0><<<s * kNHead, 128, smem, stream>>>(q, kv, nullptr, topk, sinks, kNHead,
+                                                             kHeadDim, K, slots, 0, 0, scale, out);
     g_q8time.end(stream);
     DSV4_CK(cudaGetLastError());
+}
+
+// [M2] batched MQA-512 for start_pos > 0: one grid over (row, head), ring-resolved table entries.
+void mqa512_ring(const float* q, const float* kv_new, const float* kv_ring, const int32_t* topk,
+                 const float* sinks, int s, int K, int slots, int win, int64_t start_pos,
+                 float scale, float* out, cudaStream_t stream) {
+    const size_t smem = (size_t)(kHeadDim + K) * 4;
+    const int sp0 = (int)(start_pos % win);
+    g_q8time.begin(7, stream);
+    dsv4_mqa512_kernel<1><<<s * kNHead, 128, smem, stream>>>(q, kv_ring, kv_new, topk, sinks, kNHead,
+                                                             kHeadDim, K, slots, win, sp0, scale,
+                                                             out);
+    g_q8time.end(stream);
+    DSV4_CK(cudaGetLastError());
+}
+
+// [M2] write a pass's s KV rows into the ring (start_pos > 0).  At most one wrap because s <= win, so
+// two copies cover it; same bytes and same slots as the per-row copies of the default path.
+void ring_write_rows(float* kv_cache, const float* kv_new, int win, int64_t start_pos, int s,
+                     cudaStream_t stream) {
+    const int sp0 = (int)(start_pos % win);
+    const int first = std::min(s, win - sp0);
+    DSV4_CK(cudaMemcpyAsync(kv_cache + (size_t)sp0 * kHeadDim, kv_new, (size_t)first * kHeadDim * 4,
+                            cudaMemcpyDeviceToDevice, stream));
+    if (s > first)
+        DSV4_CK(cudaMemcpyAsync(kv_cache, kv_new + (size_t)first * kHeadDim,
+                                (size_t)(s - first) * kHeadDim * 4, cudaMemcpyDeviceToDevice,
+                                stream));
+}
+
+// [M2] device twins of the host topk builders (dsv4_window_topk / dsv4_window_topk_pad, and the
+// start_pos > 0 branch of dsv4_compress_topk).  One block per row, values identical to the host code.
+__global__ void dsv4_window_topk_kernel(int win, int64_t start_pos, int nent, int stride,
+                                        int32_t* __restrict__ topk) {
+    const int j = blockIdx.x;
+    int32_t* row = topk + (size_t) j * stride;
+    if (start_pos > 0) {
+        const int64_t pos = start_pos + j;
+        if (pos >= win - 1) {
+            const int64_t sp = pos % win;
+            for (int i = threadIdx.x; i < nent; i += blockDim.x)
+                row[i] = i >= win ? -1
+                                  : (int32_t)(i < win - sp - 1 ? sp + 1 + i : i - (win - sp - 1));
+        } else {
+            for (int i = threadIdx.x; i < nent; i += blockDim.x) row[i] = i <= pos ? i : -1;
+        }
+    } else {
+        for (int i = threadIdx.x; i < nent; i += blockDim.x) {
+            const int64_t v = (j - win + 1 > 0 ? j - win + 1 : 0) + i;
+            row[i] = (int32_t)(v > j ? -1 : v);
+        }
+    }
+}
+
+__global__ void dsv4_compress_topk_kernel(int64_t ratio, int64_t start_pos, int64_t offset, int kw,
+                                          int kc, int stride, int32_t* __restrict__ topk) {
+    const int j = blockIdx.x;
+    int32_t* row = topk + (size_t) j * stride + kw;
+    const int64_t n = (start_pos + j + 1) / ratio;
+    for (int t = threadIdx.x; t < kc; t += blockDim.x) row[t] = (int32_t)(t < n ? t + offset : -1);
 }
 
 }  // namespace
@@ -956,6 +1036,33 @@ void dsv4_rope_rows_mul(float* x, int rows, int width, int half, int rows_per_to
 void dsv4_mqa512_rows(const float* q, const float* kv, const int32_t* topk, const float* sinks, int s,
                       int K, int slots, float scale, float* out, cudaStream_t stream) {
     mqa512(q, kv, topk, sinks, s, K, slots, scale, out, stream);
+}
+
+// [M2] batched prefill attention switches (see attn.hpp); both default off / opt-in only.
+bool dsv4_attn_batch_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_DSV4_ATTN_BATCH");
+        return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+void dsv4_window_topk_dev(int win, int s, int64_t start_pos, int stride, int nent, int32_t* topk,
+                          cudaStream_t stream) {
+    dsv4_window_topk_kernel<<<s, 128, 0, stream>>>(win, start_pos, nent, stride, topk);
+    DSV4_CK(cudaGetLastError());
+}
+
+void dsv4_compress_topk_dev(int64_t ratio, int s, int64_t start_pos, int64_t offset, int kw, int kc,
+                            int stride, int32_t* topk, cudaStream_t stream) {
+    dsv4_compress_topk_kernel<<<s, 128, 0, stream>>>(ratio, start_pos, offset, kw, kc, stride, topk);
+    DSV4_CK(cudaGetLastError());
+}
+
+void dsv4_mqa512_rows_ring(const float* q, const float* kv_new, const float* kv_ring,
+                           const int32_t* topk, const float* sinks, int s, int K, int slots, int win,
+                           int64_t start_pos, float scale, float* out, cudaStream_t stream) {
+    mqa512_ring(q, kv_new, kv_ring, topk, sinks, s, K, slots, win, start_pos, scale, out, stream);
 }
 
 bool dsv4_attn_workspace_init(Dsv4AttnWorkspace& ws, int max_s, int max_k) {
@@ -1130,13 +1237,20 @@ bool dsv4_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
             kv_ptr = kv_cache;
         }
     }
-    // topk (host-built, hash layers: window part only)
-    std::vector<int32_t> h_topk((size_t)s * win);
-    const auto t_tab0 = std::chrono::steady_clock::now();
-    const int K = dsv4_window_topk(win, s, start_pos, h_topk.data());
-    attn_time_host_table(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                                  t_tab0).count());
-    {
+    // topk (hash layers: window part only).  [M2] batched: built on the device into the same row layout
+    // the host builder produces (pitch K), so no host vector and no pageable upload.
+    const bool batch = dsv4_attn_batch_enabled() && start_pos > 0 && s > 1;
+    std::vector<int32_t> h_topk;
+    int K = win;
+    if (batch) {
+        AttnTimeScope t(kAtTableH2D, stream);
+        dsv4_window_topk_dev(win, s, start_pos, K, K, ws.topk, stream);
+    } else {
+        h_topk.resize((size_t)s * win);
+        const auto t_tab0 = std::chrono::steady_clock::now();
+        K = dsv4_window_topk(win, s, start_pos, h_topk.data());
+        attn_time_host_table(std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - t_tab0).count());
         AttnTimeScope t(kAtTableH2D, stream);
         DSV4_CK(cudaMemcpyAsync(ws.topk, h_topk.data(), (size_t)s * K * sizeof(int32_t),
                                 cudaMemcpyHostToDevice, stream));
@@ -1146,7 +1260,17 @@ bool dsv4_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
     const size_t smem = (size_t)(kHeadDim + K) * 4;
     // [R8] readable KV rows for this launch: the whole kv_new on prefill, the ring on decode
     const int kv_slots = start_pos == 0 ? s : win;
-    if (start_pos > 0 && s > 1) {
+    if (batch) {
+        // [M2] one launch for all s rows; the pass's KV rows go into the ring afterwards, because a
+        // window entry only ever resolves to a row at or before the attending row ([R-01]).
+        {
+            AttnTimeScope t(kAtMqa, stream);
+            dsv4_mqa512_rows_ring(ws.q, ws.kv_new, kv_cache, ws.topk, w.sinks, s, K, kv_slots, win,
+                                  start_pos, scale, ws.attn, stream);
+        }
+        AttnTimeScope t(kAtMem, stream);
+        ring_write_rows(kv_cache, ws.kv_new, win, start_pos, s, stream);
+    } else if (start_pos > 0 && s > 1) {
         // [G1] one launch per row (grid kNHead => the kernel's row index is 0 for all of them), so the
         // per-row table is the only thing that changes between rows.
         AttnTimeScope t(kAtMqa, stream);
@@ -1154,16 +1278,17 @@ bool dsv4_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
             DSV4_CK(cudaMemcpyAsync(kv_cache + ((start_pos + j) % win) * kHeadDim,
                                     ws.kv_new + (size_t)j * kHeadDim, (size_t)kHeadDim * 4,
                                     cudaMemcpyDeviceToDevice, stream));
-            dsv4_mqa512_kernel<<<kNHead, 128, smem, stream>>>(
-                ws.q + (size_t)j * kNHead * kHeadDim, kv_ptr, ws.topk + (size_t)j * K, w.sinks,
-                kNHead, kHeadDim, K, kv_slots, scale, ws.attn + (size_t)j * kNHead * kHeadDim);
+            dsv4_mqa512_kernel<0><<<kNHead, 128, smem, stream>>>(
+                ws.q + (size_t)j * kNHead * kHeadDim, kv_ptr, nullptr, ws.topk + (size_t)j * K,
+                w.sinks, kNHead, kHeadDim, K, kv_slots, 0, 0, scale,
+                ws.attn + (size_t)j * kNHead * kHeadDim);
             DSV4_CK(cudaGetLastError());
         }
     } else {
         AttnTimeScope t(kAtMqa, stream);
-        dsv4_mqa512_kernel<<<s * kNHead, 128, smem, stream>>>(ws.q, kv_ptr, ws.topk, w.sinks,
-                                                              kNHead, kHeadDim, K, kv_slots, scale,
-                                                              ws.attn);
+        dsv4_mqa512_kernel<0><<<s * kNHead, 128, smem, stream>>>(
+            ws.q, kv_ptr, nullptr, ws.topk, w.sinks, kNHead, kHeadDim, K, kv_slots, 0, 0, scale,
+            ws.attn);
         DSV4_CK(cudaGetLastError());
     }
     // inverse rope on the attention output (output-side inverse rotary trap)

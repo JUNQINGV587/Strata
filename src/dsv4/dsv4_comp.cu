@@ -63,6 +63,20 @@ constexpr double kRmsEps = 1e-6;
 
 __device__ __forceinline__ float comp_sigmoid(float v) { return 1.0f / (1.0f + expf(-v)); }
 
+// [M2] write a pass's s KV rows into the ring (start_pos > 0), the batched twin of the per-row copies
+// of the default path: s <= win, so at most one wrap and two copies cover it.
+void ring_write_rows(float* kv_cache, const float* kv_new, int win, int64_t start_pos, int s,
+                     cudaStream_t stream) {
+    const int sp0 = (int) (start_pos % win);
+    const int first = (int) std::min<int64_t>(s, win - sp0);
+    DSV4_CK(cudaMemcpyAsync(kv_cache + (size_t) sp0 * kHeadDim, kv_new,
+                            (size_t) first * kHeadDim * 4, cudaMemcpyDeviceToDevice, stream));
+    if (s > first)
+        DSV4_CK(cudaMemcpyAsync(kv_cache, kv_new + (size_t) first * kHeadDim,
+                                (size_t) (s - first) * kHeadDim * 4, cudaMemcpyDeviceToDevice,
+                                stream));
+}
+
 // ---------------------------------------------------------------------------
 // Compressor state init: kv_state = 0, score_state = -inf (dsv4ref CompState::init).
 // ---------------------------------------------------------------------------
@@ -1045,10 +1059,20 @@ bool dsv4_idx_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
     // terms and the pass is bit-identical to the wide pass's first s rows).
     const bool pad_kw = chunk_prefill && start_pos == 0 && s < win;
     const int64_t kw_cap = pad_kw ? win : (start_pos > 0 ? win : std::min<int64_t>(s, win));
-    std::vector<int32_t> h_topk((size_t) (s * kw_cap), -1);
-    const auto t_tab0 = std::chrono::steady_clock::now();
-    const int64_t kw = pad_kw ? dsv4_window_topk_pad(win, (int) s, h_topk.data())
-                              : dsv4_window_topk(win, (int) s, start_pos, h_topk.data());
+    // [M2] batched: the window list is built on the device and the ring is written after the launch.
+    const bool batch = dsv4_attn_batch_enabled() && start_pos > 0 && s > 1;
+    std::vector<int32_t> h_topk;
+    int64_t kw = 0;
+    if (batch) {
+        kw = win;  // start_pos > 0 always carries the full ring list
+    } else {
+        h_topk.assign((size_t) (s * kw_cap), -1);
+        const auto t_tab0 = std::chrono::steady_clock::now();
+        kw = pad_kw ? dsv4_window_topk_pad(win, (int) s, h_topk.data())
+                    : dsv4_window_topk(win, (int) s, start_pos, h_topk.data());
+        attn_time_host_table(std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - t_tab0).count());
+    }
     int64_t kc = 0;
     if (nc > 0) {
         if (!dsv4_indexer_workspace_reserve(iws, s, nc)) {
@@ -1096,14 +1120,17 @@ bool dsv4_idx_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
         fprintf(stderr, "dsv4 idx-check: nc=%lld K=%lld mismatched=%lld\n", (long long) nc,
                 (long long) std::min<int64_t>(512, nc), (long long) bad);
     }
-    // window rows come from the host list, indexer rows from the device buffer; one 2-D copy each
+    // window rows come from the host list (or the device build, [M2]), indexer rows from the device
+    // buffer; one 2-D copy each
     const int64_t K = kw + kc;
-    attn_time_host_table(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                                  t_tab0).count());
     {
         AttnTimeScope t(kAtTableH2D, stream);
-        DSV4_CK(cudaMemcpy2DAsync(cws.topk, (size_t) K * 4, h_topk.data(), (size_t) kw_cap * 4,
-                                  (size_t) kw * 4, (size_t) s, cudaMemcpyHostToDevice, stream));
+        if (batch) {
+            dsv4_window_topk_dev(win, (int) s, start_pos, (int) K, (int) kw, cws.topk, stream);
+        } else {
+            DSV4_CK(cudaMemcpy2DAsync(cws.topk, (size_t) K * 4, h_topk.data(), (size_t) kw_cap * 4,
+                                      (size_t) kw * 4, (size_t) s, cudaMemcpyHostToDevice, stream));
+        }
         if (kc > 0)
             DSV4_CK(cudaMemcpy2DAsync((int32_t*) cws.topk + kw, (size_t) K * 4, iws.tk,
                                       (size_t) 512 * 4, (size_t) kc * 4, (size_t) s,
@@ -1113,7 +1140,12 @@ bool dsv4_idx_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
     const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
     {
         AttnTimeScope t(kAtMqa, stream);
-        if (start_pos > 0 && s > 1) {
+        if (batch) {
+            // [M2] one launch for all s rows; the ring is written afterwards (see dsv4_attn.cu's
+            // dsv4_mqa512_rows_ring: a window entry never resolves to a row after the attending row).
+            dsv4_mqa512_rows_ring(aws.q, aws.kv_new, kv_ptr, cws.topk, w.sinks, (int) s, (int) K,
+                                  (int) (kv_slots + kc), win, start_pos, scale, aws.attn, stream);
+        } else if (start_pos > 0 && s > 1) {
             // [G1] one launch per row: the kernel's row index is 0, so only the row's own table
             // changes.  [R-01] row j's ring slot is written immediately before row j's attention, so a
             // later row's KV can never land in an earlier row's window.
@@ -1129,6 +1161,10 @@ bool dsv4_idx_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope,
             dsv4_mqa512_rows(aws.q, kv_ptr, cws.topk, w.sinks, (int) s, (int) K,
                              (int) (kv_slots + kc), scale, aws.attn, stream);
         }
+    }
+    if (batch) {
+        AttnTimeScope t(kAtMem, stream);
+        ring_write_rows(kv_cache, aws.kv_new, win, start_pos, s, stream);
     }
     // inverse rope on the attention output, then the grouped O projection
     {
@@ -1274,35 +1310,59 @@ bool dsv4_comp_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope
     // [G1] the compress block's row stride is the LARGEST row count in the batch ((start_pos+s)/ratio);
     // for s == 1 this is the old (start_pos+1)/ratio.
     const int64_t kc_cap = (start_pos + s) / ratio;
-    std::vector<int32_t> h_topk((size_t) (s * (kw_cap + kc_cap)));
-    const auto t_tab0 = std::chrono::steady_clock::now();
-    const int64_t kw = pad_kw ? dsv4_window_topk_pad(win, (int) s, h_topk.data())
-                              : dsv4_window_topk(win, (int) s, start_pos, h_topk.data());
-    const int64_t kc =
-        dsv4_compress_topk(ratio, s, start_pos, offset, h_topk.data() + (size_t) s * kw_cap);
-    // fold the two row blocks into dense [s][kw+kc] rows
-    std::vector<int32_t> h_dense((size_t) (s * (kw + kc)));
-    for (int64_t j = 0; j < s; ++j) {
-        std::memcpy(h_dense.data() + (size_t) j * (kw + kc), h_topk.data() + (size_t) j * kw_cap,
-                    (size_t) kw * sizeof(int32_t));
-        if (kc > 0)
-            std::memcpy(h_dense.data() + (size_t) j * (kw + kc) + kw,
-                        h_topk.data() + (size_t) s * kw_cap + (size_t) j * kc_cap,
-                        (size_t) kc * sizeof(int32_t));
+    // [M2] batched: both table blocks are built on the device (the compress block is the pure index
+    // function t + offset, so it needs no host pass) and the ring is written after the launch.
+    const bool batch = dsv4_attn_batch_enabled() && start_pos > 0 && s > 1;
+    std::vector<int32_t> h_topk;
+    std::vector<int32_t> h_dense;
+    int64_t kw = 0;
+    int64_t kc = 0;
+    if (batch) {
+        kw = win;         // start_pos > 0 always carries the full ring list
+        kc = kc_cap;      // = dsv4_compress_topk's return for start_pos > 0
+    } else {
+        h_topk.resize((size_t) (s * (kw_cap + kc_cap)));
+        const auto t_tab0 = std::chrono::steady_clock::now();
+        kw = pad_kw ? dsv4_window_topk_pad(win, (int) s, h_topk.data())
+                    : dsv4_window_topk(win, (int) s, start_pos, h_topk.data());
+        kc = dsv4_compress_topk(ratio, s, start_pos, offset,
+                                h_topk.data() + (size_t) s * kw_cap);
+        // fold the two row blocks into dense [s][kw+kc] rows
+        h_dense.resize((size_t) (s * (kw + kc)));
+        for (int64_t j = 0; j < s; ++j) {
+            std::memcpy(h_dense.data() + (size_t) j * (kw + kc), h_topk.data() + (size_t) j * kw_cap,
+                        (size_t) kw * sizeof(int32_t));
+            if (kc > 0)
+                std::memcpy(h_dense.data() + (size_t) j * (kw + kc) + kw,
+                            h_topk.data() + (size_t) s * kw_cap + (size_t) j * kc_cap,
+                            (size_t) kc * sizeof(int32_t));
+        }
+        attn_time_host_table(std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - t_tab0).count());
     }
     const int64_t K = kw + kc;
-    attn_time_host_table(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                                  t_tab0).count());
     {
         AttnTimeScope t(kAtTableH2D, stream);
-        DSV4_CK(cudaMemcpyAsync(cws.topk, h_dense.data(), (size_t) (s * K) * sizeof(int32_t),
-                                cudaMemcpyHostToDevice, stream));
+        if (batch) {
+            dsv4_window_topk_dev(win, (int) s, start_pos, (int) K, (int) kw, cws.topk, stream);
+            if (kc > 0)
+                dsv4_compress_topk_dev(ratio, (int) s, start_pos, offset, (int) kw, (int) kc, (int) K,
+                                       cws.topk, stream);
+        } else {
+            DSV4_CK(cudaMemcpyAsync(cws.topk, h_dense.data(), (size_t) (s * K) * sizeof(int32_t),
+                                    cudaMemcpyHostToDevice, stream));
+        }
     }
     // dense MQA-512 over the combined list, softmax scale 512^-0.5, sinks in the denominator only
     const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
     {
         AttnTimeScope t(kAtMqa, stream);
-        if (start_pos > 0 && s > 1) {
+        if (batch) {
+            // [M2] one launch for all s rows; the ring is written afterwards (see dsv4_attn.cu's
+            // dsv4_mqa512_rows_ring: a window entry never resolves to a row after the attending row).
+            dsv4_mqa512_rows_ring(aws.q, aws.kv_new, kv_ptr, cws.topk, w.sinks, (int) s, (int) K,
+                                  (int) (kv_slots + kc), win, start_pos, scale, aws.attn, stream);
+        } else if (start_pos > 0 && s > 1) {
             // [G1] one launch per row: the kernel's row index is 0, so only the row's own table
             // changes.  [R-01] row j's ring slot is written immediately before row j's attention, so a
             // later row's KV can never land in an earlier row's window.
@@ -1318,6 +1378,10 @@ bool dsv4_comp_attn_forward(const Dsv4AttnWeights& w, const Dsv4RopeTables& rope
             dsv4_mqa512_rows(aws.q, kv_ptr, cws.topk, w.sinks, (int) s, (int) K,
                              (int) (kv_slots + kc), scale, aws.attn, stream);
         }
+    }
+    if (batch) {
+        AttnTimeScope t(kAtMem, stream);
+        ring_write_rows(kv_cache, aws.kv_new, win, start_pos, s, stream);
     }
     // inverse rope on the attention output, then the grouped O projection
     {
