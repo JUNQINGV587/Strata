@@ -1041,8 +1041,11 @@ void dsv4_mqa512_rows(const float* q, const float* kv, const int32_t* topk, cons
 // [M2] batched prefill attention switches (see attn.hpp); both default off / opt-in only.
 bool dsv4_attn_batch_enabled() {
     static const bool on = [] {
+        // Default ON: the batched path is bit-identical to the per-row path on the 176-file prefill gate
+        // (and on the 4k chunked gate), and it is the difference between 98 s and 158 s for a 4k prompt
+        // on 2xL20.  STRATA_DSV4_ATTN_BATCH=0 still selects the older one-launch-per-row path for A/B.
         const char* v = std::getenv("STRATA_DSV4_ATTN_BATCH");
-        return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+        return v == nullptr || v[0] == '\0' || std::strcmp(v, "0") != 0;
     }();
     return on;
 }

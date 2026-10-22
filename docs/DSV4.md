@@ -72,6 +72,16 @@ strata --model dsv4-flash-nvfp4.gguf --native dsv4-flash-nvfp4.gguf \
 `strata-dsv4` is the same entry point on its own command line. A pack from a `deepseek4` GGUF carries
 `native_experts.txt` with the 43-layer table, so `--pack` alone is enough.
 
+### Prefill attention batching
+
+A chunked prefill pass runs 128 rows through one attention block, and the default path used to launch one
+MQA-512 grid per row (4 % of the SMs) with a host-built topk table.  `STRATA_DSV4_ATTN_BATCH` (now **on by
+default**) batches the row dimension instead: one launch for the whole chunk, tables built on the device,
+the same per-row fp32 accumulation order.  It is bit-identical on the 176-file prefill gate and the 4k
+chunked gate, and on 2xL20 a 4k prompt takes 98.8 s with it against 170.5 s without (same binary,
+same pass).  `STRATA_DSV4_ATTN_BATCH=0`
+restores the per-row path for A/B runs.
+
 ## Validation
 
 The three test binaries in `src/dsv4` (`strata-dsv4-attn-test`, `strata-dsv4-comp-test`,

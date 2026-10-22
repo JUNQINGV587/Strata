@@ -131,7 +131,7 @@ void dsv4_mqa512_rows(const float* q, const float* kv, const int32_t* topk, cons
                       int K, int slots, float scale, float* out, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// [M2] batched prefill attention (STRATA_DSV4_ATTN_BATCH=1, default off).
+// [M2] batched prefill attention (STRATA_DSV4_ATTN_BATCH, default on; =0 selects the per-row path).
 //
 // A chunked-prefill pass runs 128 rows through the same attention block, and the default path launches
 // one MQA-512 grid per row (kNHead blocks = 4 % of the SMs) after uploading a host-built topk table and
@@ -141,7 +141,7 @@ void dsv4_mqa512_rows(const float* q, const float* kv, const int32_t* topk, cons
 // written after the launch instead of per row.
 // ---------------------------------------------------------------------------
 
-// True when STRATA_DSV4_ATTN_BATCH selects the batched path (read once, cached).
+// True when the batched path is selected (default); STRATA_DSV4_ATTN_BATCH=0 turns it off.
 bool dsv4_attn_batch_enabled();
 
 // Device twin of dsv4_window_topk / dsv4_window_topk_pad: `stride` is the row pitch in entries, `nent`
