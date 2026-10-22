@@ -724,6 +724,14 @@ struct Dsv4MoeWs {
     // [S7a] grouped staging: chunk blobs staged side by side, one grouped launch per role per chunk
     int chunk = 0;                       ///< staged blobs per grouped pass (STRATA_DSV4_MOE_CHUNK, dflt 8)
     uint8_t* blob_stage = nullptr;       ///< chunk * blob_bytes
+    // [M3] STRATA_DSV4_MOE_STAGE=1: the staged blobs travel host -> PINNED slot -> H2D, replacing the
+    // pageable source whose driver bounce-buffer copy blocks this thread.  The H2D stays on the KERNEL
+    // stream on purpose: `dst` is the one staging arena the compute stream is still reading across chunk
+    // boundaries, so the DMA must be ordered behind those readers; a side stream needs a double-buffered
+    // arena (measured: +113 MB, no wall-clock gain -- see REPORT-PREFILL-MOE.md section 3.2).
+    uint8_t* pin_stage = nullptr;        ///< pin_slots * blob_bytes, page-locked
+    cudaEvent_t stage_ev[8] = {};        ///< [M3] one per pinned slot: fires when its H2D has consumed the slot
+    int pin_slots = 0;
     uint8_t** d_ptrs = nullptr;          ///< device: chunk blob addresses (staging/cache/peer slots)
     int32_t* d_ebase = nullptr;          ///< device: chunk + 1 entry offsets per group
     // [S7e] one-upload arena: the chunk's table (ptrs | ebase | tok | pw | comb cell) is packed into
@@ -2208,6 +2216,16 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
         // 16 = one weight stage reused by up to 16 tokens (STRATA_DSV4_MOE_REUSE=1).
         const int moe_reuse = dsv4_ablit("STRATA_DSV4_MOE_REUSE") ? 16 : 1;
         const uint64_t blob_bytes = (uint64_t) lay.blob_bytes(layer);
+        // [M3] pinned staging ring, allocated once (8 x blob_bytes = 113 MB at blob 14.16 MB); one
+        // event per slot orders the host's next fill behind the DMA that still owns the slot.
+        static const bool moe_stage = dsv4_ablit("STRATA_DSV4_MOE_STAGE");
+        if (moe_stage && ws->pin_stage == nullptr && blob_bytes > 0) {
+            CKM(cudaMallocHost((void**) &ws->pin_stage, (size_t) 8 * blob_bytes));
+            ws->pin_slots = 8;
+            for (int i = 0; i < 8; ++i) CKM(cudaEventCreateWithFlags(&ws->stage_ev[i], cudaEventDisableTiming));
+            std::fprintf(stderr, "strata-dsv4: moe stage: 8 pinned slots x %.2f MiB\n",
+                         (double) blob_bytes / (1024.0 * 1024.0));
+        }
         const bool peer_on = ws->cache[0] != nullptr && ws->cache[1] != nullptr && ws->peer.active;
         // [S10] read the layer's missing blobs into pinned slots before the admission loops, which can
         // then queue a plain pinned H2D instead of stalling this thread on a pageable bounce
@@ -2590,6 +2608,7 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                 }
             }
         } else {
+        int64_t stage_slot = 0;   // [M3] ring index into ws->pin_stage
         for (int64_t z0 = 0; z0 < n_groups; z0 += ws->chunk) {
             const int64_t u = std::min<int64_t>((int64_t) ws->chunk, n_groups - z0);
             int mt_pfw = -1;
@@ -2639,8 +2658,30 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                         if (scratch != nullptr) std::memcpy(scratch, blob, (size_t) blob_bytes);
                     } else if (!dsv4_ablit("STRATA_ABL_NOCOPY")) {
                         const auto pfdm0 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                        CKM(cudaMemcpyAsync(dst, blob, (size_t) blob_bytes, cudaMemcpyHostToDevice,
-                                            stream));
+                        if (moe_stage && ws->pin_stage != nullptr) {
+                            // [M3] host -> pinned slot -> H2D on the KERNEL stream: byte-for-byte the
+                            // same source, only the transport changed.  The DMA stays ordered behind
+                            // the previous chunk's kernels because `dst` lives in the one staging arena
+                            // the compute stream is still reading across chunk boundaries.
+                            const auto hs0 = std::chrono::steady_clock::now();
+                            const int sl = (int) (stage_slot & (ws->pin_slots - 1));
+                            uint8_t* pb = ws->pin_stage + (size_t) sl * (size_t) blob_bytes;
+                            // the previous H2D out of this slot is asynchronous on the device: the
+                            // host may not overwrite pb until it has consumed the slot.
+                            if (ws->stage_ev[sl] != nullptr) CKM(cudaEventSynchronize(ws->stage_ev[sl]));
+                            dsv4_cp_read_mt(blob, pb, (size_t) blob_bytes, 4);
+                            if (g_moe_time.on)
+                                g_moe_time.host_stage_ms +=
+                                    std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - hs0).count();
+                            CKM(cudaMemcpyAsync(dst, pb, (size_t) blob_bytes, cudaMemcpyHostToDevice,
+                                                stream));
+                            CKM(cudaEventRecord(ws->stage_ev[sl], stream));
+                            ++stage_slot;
+                        } else {
+                            CKM(cudaMemcpyAsync(dst, blob, (size_t) blob_bytes, cudaMemcpyHostToDevice,
+                                                stream));
+                        }
                         if (pft_on) {
                             ws->pft.stage_dma += std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - pfdm0).count();
