@@ -63,6 +63,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 
 #include "dsv4_moe.h"
+#include "dsv4_moe_time.h"
 #include "strata/dsv4/attn.hpp"
 #include "strata/dsv4/comp.hpp"
 
@@ -1708,6 +1709,7 @@ int strata::dsv4::run(int argc, char** argv) {
     } else if (o.serve || o.have_tokens)
         std::fprintf(stderr, "strata-dsv4: S0 loads and reports only; generation arrives with S1-S7\n");
     attn_time_flush();
+    moe_time_flush();
     std::fprintf(stderr, "strata-dsv4: %s OK, exiting clean\n", o.forward ? "S5 forward" : "S0 load");
     return 0;
 }
