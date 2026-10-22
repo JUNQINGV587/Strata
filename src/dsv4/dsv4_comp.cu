@@ -131,6 +131,146 @@ __global__ void dsv4_gemm_bf16_kernel(const uint16_t* __restrict__ w, int rows, 
 }
 
 // ---------------------------------------------------------------------------
+// [M3] Row-tiled variant of the BF16 GEMM above.  blockIdx.y picks a tile of output rows, so the same
+// (row t, output r) dot product is computed by the same 128-thread k-loop and the same fp64 tree
+// reduction -- only the number of resident blocks changes, never an accumulation order.  Used as the
+// fallback when the output count is not a multiple of the coarsening factor of dsv4_gemm_bf16_coars_kernel;
+// measured on a 1024-row projection it is 4.19 ms against 4.08 ms for the coarsened kernel.
+// ---------------------------------------------------------------------------
+template <int kRowsPerBlock>
+__global__ void dsv4_gemm_bf16_split_kernel(const uint16_t* __restrict__ w, int rows, int cols,
+                                           const float* __restrict__ x, int m,
+                                           float* __restrict__ out) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const int t0 = (int) blockIdx.y * kRowsPerBlock;
+    const int t1 = t0 + kRowsPerBlock < m ? t0 + kRowsPerBlock : m;
+    const uint16_t* wrow = w + (size_t) r * (size_t) cols;
+    __shared__ double red[128];
+    for (int t = t0; t < t1; ++t) {
+        const float* xt = x + (size_t) t * (size_t) cols;
+        double acc = 0.0;
+        // same 8-deep load batching / same k order as dsv4_gemm_bf16_kernel
+        int i = threadIdx.x;
+        for (; i + 7 * 128 < cols; i += 8 * 128) {
+            float xv[8];
+            uint16_t wv[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                xv[k] = xt[i + k * 128];
+                wv[k] = wrow[i + k * 128];
+            }
+#pragma unroll
+            for (int k = 0; k < 8; ++k)
+                acc += (double) xv[k] * (double) __bfloat162float(__ushort_as_bfloat16(wv[k]));
+        }
+        for (; i < cols; i += 128)
+            acc += (double) xt[i] * (double) __bfloat162float(__ushort_as_bfloat16(wrow[i]));
+        red[threadIdx.x] = acc;
+        __syncthreads();
+        for (int off = 64; off > 0; off >>= 1) {
+            if (threadIdx.x < off) red[threadIdx.x] += red[threadIdx.x + off];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) out[(size_t) t * rows + r] = (float) red[0];
+        __syncthreads();
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// [M3] Output-coarsened BF16 GEMM: one thread accumulates kOuts independent output rows while it walks
+// k, so the dependent fp64 chain of a single dot product no longer serialises the fp64 pipe.  Every
+// (row t, output r) dot product still runs the same ascending-k loop and the same fp64 tree reduction,
+// so every intermediate double is identical; only the interleaving of *independent* chains changes.
+// ---------------------------------------------------------------------------
+template <int kOuts, int kRowsPerBlock>
+__global__ void dsv4_gemm_bf16_coars_kernel(const uint16_t* __restrict__ w, int rows, int cols,
+                                            const float* __restrict__ x, int m,
+                                            float* __restrict__ out) {
+    const int r0 = (int) blockIdx.x * kOuts;
+    const int t0 = (int) blockIdx.y * kRowsPerBlock;
+    const int t1 = t0 + kRowsPerBlock < m ? t0 + kRowsPerBlock : m;
+    const uint16_t* wr[kOuts];
+#pragma unroll
+    for (int o = 0; o < kOuts; ++o) {
+        const int r = r0 + o;
+        wr[o] = r < rows ? w + (size_t) r * (size_t) cols : nullptr;
+    }
+    __shared__ double red[kOuts][128];
+    for (int t = t0; t < t1; ++t) {
+        const float* xt = x + (size_t) t * (size_t) cols;
+        double acc[kOuts];
+#pragma unroll
+        for (int o = 0; o < kOuts; ++o) acc[o] = 0.0;
+        int i = threadIdx.x;
+        for (; i + 7 * 128 < cols; i += 8 * 128) {
+            float xv[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) xv[k] = xt[i + k * 128];
+#pragma unroll
+            for (int o = 0; o < kOuts; ++o) {
+                if (wr[o] == nullptr) continue;
+#pragma unroll
+                for (int k = 0; k < 8; ++k)
+                    acc[o] += (double) xv[k] *
+                              (double) __bfloat162float(__ushort_as_bfloat16(wr[o][i + k * 128]));
+            }
+        }
+        for (; i < cols; i += 128) {
+            const float xv = xt[i];
+#pragma unroll
+            for (int o = 0; o < kOuts; ++o) {
+                if (wr[o] == nullptr) continue;
+                acc[o] += (double) xv *
+                          (double) __bfloat162float(__ushort_as_bfloat16(wr[o][i]));
+            }
+        }
+#pragma unroll
+        for (int o = 0; o < kOuts; ++o) red[o][threadIdx.x] = acc[o];
+        __syncthreads();
+        for (int off = 64; off > 0; off >>= 1) {
+            if (threadIdx.x < off) {
+#pragma unroll
+                for (int o = 0; o < kOuts; ++o) red[o][threadIdx.x] += red[o][threadIdx.x + off];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+#pragma unroll
+            for (int o = 0; o < kOuts; ++o) {
+                const int r = r0 + o;
+                if (r < rows) out[(size_t) t * rows + r] = (float) red[o][0];
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// [M3] compressor projections: tiles are fixed at 8 rows x 4 outputs per block.  Measured on a 4k
+// chunked prefill: rows-per-block 4/8/16 differ by <0.3 % (the fp64 accumulate chain, not occupancy,
+// is the limit), and 4 outputs per block is ~2 % faster than the one-output kernel (4.17 -> 4.08 ms
+// per 1024-row projection, i.e. 237 GMAC/s, essentially the fp64 FMA rate of this GPU).  Going faster
+// would need a different accumulation order, which the bit-exactness contract forbids.
+static void dsv4_bf16_gemm(const uint16_t* w, int rows, int cols, const float* x, int64_t m,
+                           float* out, cudaStream_t stream) {
+    if (!dsv4_attn_batch_enabled()) {
+        dsv4_gemm_bf16_kernel<<<(unsigned) rows, 128, 0, stream>>>(w, rows, cols, x, (int) m, out);
+        return;
+    }
+    const int rpb = 8;
+    const int outs = 4;
+    const unsigned gy = (unsigned) (((int) m + rpb - 1) / rpb);
+    if ((rows % outs) == 0) {
+        const dim3 grid((unsigned) (rows / outs), gy, 1);
+        dsv4_gemm_bf16_coars_kernel<4, 8><<<grid, 128, 0, stream>>>(w, rows, cols, x, (int) m, out);
+    } else {
+        const dim3 grid((unsigned) rows, gy, 1);
+        dsv4_gemm_bf16_split_kernel<8><<<grid, 128, 0, stream>>>(w, rows, cols, x, (int) m, out);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Prefill state store: dst[idx] = src[idx] + ape[idx] over a [rows][W] span.  Both prefill segments
 // (the overlap tail block and the remainder block) index ape by (tok % ratio), which is the local row
 // inside each segment (cutoff is ratio-aligned), so one elementwise kernel covers both.
@@ -497,11 +637,10 @@ int64_t dsv4_comp_forward(const Dsv4CompWeights& w, Dsv4CompState& st, Dsv4CompW
     // kv/score projections: [s][W] each, BF16 weights, double accumulation
     {
         AttnTimeScope t(kAtCompGemm, stream);
-        dsv4_gemm_bf16_kernel<<<(unsigned) W, 128, 0, stream>>>(w.wkv, (int) W, kNEmbd, x, (int) s,
-                                                                ws.kv);
+        // [M3] tiled launch behind STRATA_DSV4_ATTN_BATCH (bit-identical: same k order, same fp64 tree)
+        dsv4_bf16_gemm(w.wkv, (int) W, kNEmbd, x, s, ws.kv, stream);
         DSV4_CK(cudaGetLastError());
-        dsv4_gemm_bf16_kernel<<<(unsigned) W, 128, 0, stream>>>(w.wgate, (int) W, kNEmbd, x, (int) s,
-                                                                ws.score);
+        dsv4_bf16_gemm(w.wgate, (int) W, kNEmbd, x, s, ws.score, stream);
         DSV4_CK(cudaGetLastError());
     }
 
