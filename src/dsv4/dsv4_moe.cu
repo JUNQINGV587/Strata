@@ -926,6 +926,12 @@ struct Dsv4MoeWs {
         double launch = 0;         ///< kernel launches
         double pintab = 0;         ///< dsv4_pintab_take (waits out the arena's previous copy)
         double tail_sync = 0;      ///< the layer-end cudaStreamSynchronize
+        /// [P2] the whole host-side admission (victim scan + fill enqueue), summed over every call of
+        /// the layer.  This is the attribution the peer split and resolve0 columns were missing: both
+        /// are accumulators around a LOOP, so they could not say whether the loop body or the
+        /// admission inside it was the cost.
+        double admit_ms = 0;
+        int64_t admit_n = 0;
         int64_t calls = 0, groups = 0, g0 = 0, g1 = 0, entries = 0, chunks = 0, launches = 0;
         int64_t hit0 = 0, miss0 = 0, admit0 = 0, fail0 = 0, hit1 = 0, miss1 = 0, admit1 = 0, fail1 = 0;
         int64_t staged = 0, staged_pf = 0, blob_calls = 0, pf_reads = 0;
@@ -998,6 +1004,47 @@ struct Dsv4MoeWs {
         std::vector<std::thread> workers;           ///< still reading this layer's set
     };
     PfWs pf;
+
+    /// [P1] VRAM look-ahead ring: the blobs the next few layers are PREDICTED to need are read into
+    /// pinned slots and DMA'd into a device-0 ring on a dedicated copy stream while the current layer
+    /// computes — the 248 MiB/layer of PCIe traffic lands inside the compute window instead of in front
+    /// of it.  The demand path below changes by exactly one decision: a predicted expert that is not
+    /// resident skips its PCIe fill (D2D from the ring instead) or is read straight out of the ring
+    /// when the cache has no room.  Same bytes, same slot, same kernels: bit-exactness is untouched.
+    struct PvWs {
+        bool on = false, init_tried = false;
+        int n = 0;                       ///< ring slots (STRATA_DSV4_PV_SLOTS, default 64)
+        int depth = 1;                   ///< layers ahead (STRATA_DSV4_PV_DEPTH)
+        int mode = 1;                    ///< 1: predict from the previous pass, 2: this layer's own routing
+                                         ///< for the next layer (STRATA_DSV4_PV=2 - a whole layer of runway)
+        int n_thread = 8;                ///< reader threads (STRATA_DSV4_PV_THREADS)
+        std::vector<int32_t> route;      ///< scratch: mode 2's sorted routed set
+        std::vector<uint8_t> mark;       ///< scratch: presence mask for the set above
+        size_t bytes = 0;                ///< one blob
+        uint8_t* ring = nullptr;         ///< device-0 arena, n * bytes
+        std::vector<uint8_t*> pin;       ///< n page-locked read targets, one per slot
+        cudaStream_t st = nullptr;       ///< dedicated copy stream (NEVER the compute stream)
+        std::vector<cudaEvent_t> fill;   ///< recorded on st: slot's H2D landed
+        std::vector<cudaEvent_t> ready;  ///< recorded on st: slot's D2D into a cache slot landed
+        std::vector<cudaEvent_t> freed;  ///< recorded on the compute stream: slot's consumer is done
+        std::vector<int32_t> sl, se;     ///< slot -> predicted (layer, expert)
+        std::vector<int8_t> state;       ///< 0 free, 1 filling, 2 ready, 3 in use by a layer
+        std::vector<int> used;           ///< slots this layer consumed (free events at the tail)
+        std::vector<std::thread> readers;///< this batch's readers (joined by the NEXT prefetch)
+        std::vector<int32_t> batch;      ///< slots this batch fills, in read order
+        int64_t n_batch = 0, n_read = 0;
+        int64_t hits = 0, admits = 0, staged = 0, late = 0, fallback = 0, lookups = 0;
+        double fill_ms = 0, join_ms = 0, drain_ms = 0;   ///< per-call host costs of the prefetch itself
+        double bytes_moved = 0;          ///< PCIe bytes moved by the ring (bandwidth attribution)
+        double queued_bytes = 0;         ///< bytes of the batch in flight, cleared when its fills drain
+        double pending_bytes = 0;        ///< bytes of the last drained batch
+        int64_t layer_calls = 0;
+        std::atomic<int> next_read{0};   ///< reader hand-out cursor for the current batch
+        std::atomic<int> count_read{0};  ///< blobs whose fill event was recorded
+        std::atomic<int> fail_read{0};   ///< blobs the reader could not queue
+        std::atomic<int64_t> read_ms{0}; ///< summed reader wall time (us)
+    };
+    PvWs pv;
 };
 
 // [S8] A/B switch for the pinned upload arenas (0 = the pre-S8 pageable staging path)
@@ -1447,9 +1494,16 @@ void dsv4_moe_ws_reset_timing(Dsv4MoeWs* ws) {
 // worker threads and the demand path is untouched, so this is pure I/O scheduling: no numeric effect,
 // and a wrong prediction just wastes readahead.  The engine calls this once per layer, before the
 // attention half; the routing itself is recorded at the end of that layer's MoE half.
+// [P1] VRAM look-ahead ring: queue the next layers' predicted blobs (see Dsv4MoeWs::PvWs).
+static void dsv4_pv_prefetch(Dsv4MoeWs* ws, strata::core::FileExpertSource& experts, int64_t layer,
+                             const std::vector<int32_t>* routed_now = nullptr);
+
 void dsv4_moe_prefetch_ahead(Dsv4MoeWs* ws, strata::core::FileExpertSource& experts, int64_t layer) {
     if (!ws || ws->cpu_pool) return;                    // the CPU-pool path reads the blobs itself
     if (ws->n_layers <= 0 || layer < 0 || layer >= ws->n_layers) return;
+    // [P1] the VRAM ring first: it joins the previous batch's readers and queues the next layers' blobs.
+    // [P1b] only in mode 1 - mode 2 queues from inside dsv4_moe_half, once this layer's routing is known.
+    if ((ws->pv.on || ws->pv.init_tried) && ws->pv.mode == 1) dsv4_pv_prefetch(ws, experts, layer);
     if ((int64_t) ws->h_prev_route.size() < ws->n_layers) return;   // first pass: nothing predicted yet
     for (int64_t d = 1; d <= ws->pf_depth; ++d) {
         const int64_t pl = (layer + d) % ws->n_layers;
@@ -1623,6 +1677,9 @@ static bool dsv4_pf_init(Dsv4MoeWs* ws, int64_t blob_bytes) {
 // exactly once and the DMA that follows reads page-locked memory instead of stalling the host.
 static void dsv4_pf_join(Dsv4MoeWs* ws);
 
+// [P1] VRAM look-ahead ring (implemented below the prefetch pool it tunes against).
+static int32_t dsv4_pv_lookup(Dsv4MoeWs* ws, int64_t layer, int32_t e);
+
 static bool dsv4_pf_layer(Dsv4MoeWs* ws, strata::core::FileExpertSource& experts, int64_t layer,
                           const std::vector<int32_t>& groups, bool peer_on, int64_t blob_bytes) {
     Dsv4MoeWs::PfWs& pf = ws->pf;
@@ -1652,6 +1709,8 @@ static bool dsv4_pf_layer(Dsv4MoeWs* ws, strata::core::FileExpertSource& experts
     for (const int32_t g : groups) {
         strata::core::ExpertCache* C = (peer_on && (g & 1) && ws->cache[1] != nullptr) ? ws->cache[1] : ws->cache[0];
         if (C != nullptr && C->slot_of(layer, g) >= 0) continue;   // resident: nothing to move
+        // [P1] the VRAM ring already holds this blob for this layer: nothing to read, nothing to move
+        if (ws->pv.on && !(ws->pv.sl.empty()) && dsv4_pv_lookup(ws, layer, g) >= 0) continue;
         miss.push_back(g);
     }
     if (!miss.empty() && peer_on) {
@@ -1708,6 +1767,275 @@ static void dsv4_pf_join(Dsv4MoeWs* ws) {
     ws->pf.workers.clear();
 }
 
+// [P1] The VRAM look-ahead ring (see Dsv4MoeWs::PvWs).  The layer's staging cost is 248 MiB of PCIe
+// per layer, and it was paid *in front of* the kernels because the demand path reads and DMA's one blob
+// at a time on the thread that also builds the tables.  Here the predicted blobs of the next
+// `PV_DEPTH` layers are read into pinned slots by `PV_THREADS` readers and DMA'd into a device-0 ring
+// on `PV_STREAM` while the current layer computes; the demand path then either copies ring->cache slot
+// (D2D, no PCIe) or reads the ring slot straight out of VRAM.  The bytes and the kernels are the same,
+// so a run with STRATA_DSV4_PV=0 takes exactly the pre-P1 path.
+static void dsv4_pv_join(Dsv4MoeWs* ws) {
+    Dsv4MoeWs::PvWs& pv = ws->pv;
+    if (pv.readers.empty()) return;
+    for (std::thread& t : pv.readers) {
+        if (t.joinable()) t.join();
+    }
+    pv.readers.clear();
+}
+
+static bool dsv4_pv_init(Dsv4MoeWs* ws, int64_t blob_bytes) {
+    Dsv4MoeWs::PvWs& pv = ws->pv;
+    if (pv.init_tried) return pv.on;
+    pv.init_tried = true;
+    if (const char* e = std::getenv("STRATA_DSV4_PV"); e != nullptr && std::atoi(e) == 0) return false;
+    if (const char* e = std::getenv("STRATA_DSV4_PV")) pv.mode = (std::atoi(e) == 2) ? 2 : 1;
+    pv.bytes = (size_t) blob_bytes;
+    pv.mark.assign((size_t) ws->ne, 0);
+    pv.n = 64;
+    pv.depth = 1;
+    pv.n_thread = 8;
+    if (const char* t = std::getenv("STRATA_DSV4_PV_SLOTS")) {
+        const int v = std::atoi(t);
+        if (v >= 4 && v <= 256) pv.n = v;
+    }
+    if (const char* t = std::getenv("STRATA_DSV4_PV_DEPTH")) {
+        const int v = std::atoi(t);
+        if (v >= 1 && v <= 8) pv.depth = v;
+    }
+    if (const char* t = std::getenv("STRATA_DSV4_PV_THREADS")) {
+        const int v = std::atoi(t);
+        if (v >= 1 && v <= 32) pv.n_thread = v;
+    }
+    if (cudaMalloc((void**) &pv.ring, pv.bytes * (size_t) pv.n) != cudaSuccess) {
+        (void) cudaGetLastError();
+        pv.ring = nullptr;
+        return false;
+    }
+    pv.pin.assign((size_t) pv.n, nullptr);
+    int ok = 0;
+    for (int i = 0; i < pv.n; ++i) {
+        if (cudaHostAlloc((void**) &pv.pin[(size_t) i], pv.bytes, cudaHostAllocPortable) != cudaSuccess) {
+            (void) cudaGetLastError();
+            break;
+        }
+        ++ok;
+    }
+    if (ok < 4) {
+        for (int i = 0; i < ok; ++i) (void) cudaFreeHost(pv.pin[(size_t) i]);
+        pv.pin.clear();
+        (void) cudaFree(pv.ring);
+        pv.ring = nullptr;
+        return false;
+    }
+    pv.n = ok;
+    if (cudaStreamCreateWithFlags(&pv.st, cudaStreamNonBlocking) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    pv.fill.assign((size_t) pv.n, nullptr);
+    pv.ready.assign((size_t) pv.n, nullptr);
+    pv.freed.assign((size_t) pv.n, nullptr);
+    for (int i = 0; i < pv.n; ++i) {
+        if (cudaEventCreateWithFlags(&pv.fill[(size_t) i], cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&pv.ready[(size_t) i], cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&pv.freed[(size_t) i], cudaEventDisableTiming) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+    }
+    pv.sl.assign((size_t) pv.n, -1);
+    pv.se.assign((size_t) pv.n, -1);
+    pv.state.assign((size_t) pv.n, 0);
+    pv.used.reserve((size_t) pv.n);
+    pv.batch.reserve((size_t) pv.n);
+    pv.on = true;
+    std::fprintf(stderr, "strata-dsv4: VRAM prefetch ring ON: %d slots x %.2f MiB = %.0f MiB, depth %d, %d readers\n",
+                 pv.n, (double) pv.bytes / 1048576.0, (double) (pv.bytes * (size_t) pv.n) / 1048576.0, pv.depth,
+                 pv.n_thread);
+    return true;
+}
+
+// A predicted pair that is queued (state 2) or being consumed (state 3) for `layer`.
+static int32_t dsv4_pv_lookup(Dsv4MoeWs* ws, int64_t layer, int32_t e) {
+    Dsv4MoeWs::PvWs& pv = ws->pv;
+    if (!pv.on) return -1;
+    for (int i = 0; i < pv.n; ++i) {
+        if (pv.se[(size_t) i] == e && pv.sl[(size_t) i] == layer) {
+            const int8_t s = pv.state[(size_t) i];
+            if (s == 2 || s == 3) return i;
+        }
+    }
+    return -1;
+}
+
+// Slot `i` for the demand path: the compute stream may read it once the H2D has landed.
+static uint8_t* dsv4_pv_take(Dsv4MoeWs* ws, int32_t i, cudaStream_t stream) {
+    Dsv4MoeWs::PvWs& pv = ws->pv;
+    if (i < 0 || i >= pv.n) return nullptr;
+    if (cudaStreamWaitEvent(stream, pv.fill[(size_t) i], 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    pv.state[(size_t) i] = 3;
+    pv.used.push_back(i);
+    return pv.ring + (size_t) i * pv.bytes;
+}
+
+// Slot `i` copied into a cache slot on the ring's own stream; the compute stream waits on the copy.
+static bool dsv4_pv_to_slot(Dsv4MoeWs* ws, int32_t i, uint8_t* dst, size_t bytes, cudaStream_t stream) {
+    Dsv4MoeWs::PvWs& pv = ws->pv;
+    if (i < 0 || i >= pv.n || dst == nullptr) return false;
+    if (cudaMemcpyAsync(dst, pv.ring + (size_t) i * pv.bytes, bytes, cudaMemcpyDeviceToDevice, pv.st) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (cudaEventRecord(pv.ready[(size_t) i], pv.st) != cudaSuccess ||
+        cudaStreamWaitEvent(stream, pv.ready[(size_t) i], 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    pv.state[(size_t) i] = 3;
+    pv.used.push_back(i);
+    return true;
+}
+
+// Slots a finished layer no longer reads go back to the pool once the compute stream passed them.
+static void dsv4_pv_layer_done(Dsv4MoeWs* ws, cudaStream_t stream) {
+    Dsv4MoeWs::PvWs& pv = ws->pv;
+    if (!pv.on || pv.used.empty()) return;
+    for (const int i : pv.used) {
+        if (cudaEventRecord(pv.freed[(size_t) i], stream) == cudaSuccess) pv.state[(size_t) i] = 3;
+    }
+    pv.used.clear();
+}
+
+static void dsv4_pv_recycle(Dsv4MoeWs* ws, int64_t layer) {
+    Dsv4MoeWs::PvWs& pv = ws->pv;
+    for (int i = 0; i < pv.n; ++i) {
+        const int8_t s = pv.state[(size_t) i];
+        if (s == 3) {
+            const cudaError_t q = cudaEventQuery(pv.freed[(size_t) i]);
+            if (q == cudaSuccess || q != cudaErrorNotReady) {
+                (void) cudaGetLastError();
+                pv.state[(size_t) i] = 0;
+                pv.sl[(size_t) i] = -1;
+                pv.se[(size_t) i] = -1;
+            }
+        } else if (s == 2 && pv.sl[(size_t) i] < layer) {
+            // predicted, never taken, and its layer is behind us: reuse the slot once its DMA is read out
+            const cudaError_t q = cudaEventQuery(pv.fill[(size_t) i]);
+            if (q == cudaSuccess || q != cudaErrorNotReady) {
+                (void) cudaGetLastError();
+                pv.state[(size_t) i] = 0;
+                pv.sl[(size_t) i] = -1;
+                pv.se[(size_t) i] = -1;
+            }
+        }
+    }
+}
+
+// Read + DMA the blobs the next `depth` layers are predicted to need.  Called once per layer from
+// dsv4_moe_prefetch_ahead (before the attention half), so the copies overlap attention + the previous
+// layer's kernels; the next call joins this batch's readers first.
+static void dsv4_pv_prefetch(Dsv4MoeWs* ws, strata::core::FileExpertSource& experts, int64_t layer,
+                             const std::vector<int32_t>* routed_now) {
+    Dsv4MoeWs::PvWs& pv = ws->pv;
+    if (!pv.on) return;
+    const auto t_join = std::chrono::steady_clock::now();
+    // 1. Has the previous batch's PCIe traffic finished?  A whole layer ran since it was queued, so the
+    // answer is normally yes and this drains in ~0 ms — the point of the pipeline.  A nonzero figure is
+    // the staging the ring failed to hide (it is what the demand path then pays again).
+    if (pv.queued_bytes > 0) {
+        for (;;) {
+            bool pending = false;
+            for (const int i : pv.batch) {
+                if (cudaEventQuery(pv.fill[(size_t) i]) == cudaErrorNotReady) { pending = true; break; }
+            }
+            if (!pending) break;
+            if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_join).count() > 250.0) break;
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        (void) cudaGetLastError();
+        pv.drain_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_join).count();
+        pv.pending_bytes = pv.queued_bytes;
+        pv.queued_bytes = 0;
+        pv.bytes_moved += pv.pending_bytes;
+    }
+    dsv4_pv_join(ws);
+    pv.join_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_join).count();
+    pv.batch.clear();
+    if (ws->n_layers <= 0) return;
+    dsv4_pv_recycle(ws, layer);
+    strata::core::ExpertCache* C0 = ws->cache[0];
+    auto queue_one = [&](int64_t pl, int32_t e) {
+        if (pl < 0 || pl >= ws->n_layers) return;
+        if (e < 0 || e >= ws->ne) return;
+        if (C0 != nullptr && C0->slot_of(pl, e) >= 0) return;   // the VRAM tier serves it
+        if (dsv4_pv_lookup(ws, pl, e) >= 0) return;             // already queued
+        int slot = -1;
+        for (int i = 0; i < pv.n; ++i) {
+            if (pv.state[(size_t) i] == 0) { slot = i; break; }
+        }
+        if (slot < 0) return;
+        pv.state[(size_t) slot] = 1;
+        pv.sl[(size_t) slot] = pl;
+        pv.se[(size_t) slot] = e;
+        pv.batch.push_back(slot);
+    };
+    if (routed_now != nullptr) {
+        // [P1b] mode 2: the caller knows THIS layer's routing, so the set is for layer + 1.
+        for (const int32_t e : *routed_now) queue_one(layer + 1, e);
+    } else {
+        if ((size_t) ws->n_layers > ws->h_prev_route.size()) return;
+        for (int d = 1; d <= pv.depth; ++d) {
+            const int64_t pl = layer + d;
+            if (pl >= ws->n_layers) break;
+            for (const int64_t e64 : ws->h_prev_route[(size_t) pl]) queue_one(pl, (int32_t) e64);
+        }
+    }
+    if (pv.batch.empty()) return;
+    ++pv.n_batch;
+    const int nb = (int) pv.batch.size();
+    const int nt = std::min(pv.n_thread, nb);
+    pv.queued_bytes = (double) (pv.bytes * (size_t) nb);
+    pv.next_read.store(0);
+    pv.count_read.store(0);
+    pv.fail_read.store(0);
+    pv.read_ms.store(0);
+    pv.n_read += nb;
+    const auto t_fill = std::chrono::steady_clock::now();
+    for (int t = 0; t < nt; ++t) {
+        pv.readers.emplace_back([ws, &experts] {
+            Dsv4MoeWs::PvWs& p = ws->pv;
+            (void) cudaSetDevice(0);
+            const auto t0 = std::chrono::steady_clock::now();
+            for (;;) {
+                const int k = p.next_read.fetch_add(1);
+                if (k >= (int) p.batch.size()) break;
+                const int i = p.batch[(size_t) k];
+                const uint8_t* src = experts.blob(p.sl[(size_t) i], p.se[(size_t) i]);
+                if (src != nullptr) std::memcpy(p.pin[(size_t) i], src, p.bytes);
+                if (cudaMemcpyAsync(p.ring + (size_t) i * p.bytes, p.pin[(size_t) i], p.bytes,
+                                    cudaMemcpyHostToDevice, p.st) == cudaSuccess &&
+                    cudaEventRecord(p.fill[(size_t) i], p.st) == cudaSuccess) {
+                    std::atomic_thread_fence(std::memory_order_release);
+                    p.state[(size_t) i] = 2;   // published only after the fill event is recorded
+                    p.count_read.fetch_add(1);
+                } else {
+                    (void) cudaGetLastError();
+                    p.state[(size_t) i] = 0;
+                    p.sl[(size_t) i] = -1;
+                    p.se[(size_t) i] = -1;
+                    p.fail_read.fetch_add(1);
+                }
+            }
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            p.read_ms.fetch_add((int64_t) (ms * 1000.0));
+        });
+    }
+    pv.fill_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_fill).count();
+}
+
 // [A1] The coldest heat among `C`'s residents of layer `l`, refreshed only when this call's heat
 // update or an admission in that layer invalidated it.  Empty layers keep `max()` so they never win
 // the cross-layer scan; the scan itself then rescans the winning layer for the actual expert id,
@@ -1741,11 +2069,23 @@ static float dsv4_hmin(Dsv4MoeWs* ws, strata::core::ExpertCache* C, int dev, int
 // narrow pass (s <= 6, decode) keeps the same-layer search exactly, so its residency behaviour is
 // unchanged.
 enum : int { kAdmFree = 0, kAdmEvict = 1, kAdmNoHeat = 2, kAdmGate = 3, kAdmNoVictim = 4, kAdmIoErr = 5 };
+// [P2] One admission's host cost, reported by PFTIME (see PfTime::admit_ms).
+struct Dsv4AdmTimer {
+    Dsv4MoeWs* ws;
+    std::chrono::steady_clock::time_point t0;
+    explicit Dsv4AdmTimer(Dsv4MoeWs* w) : ws(w), t0(std::chrono::steady_clock::now()) {}
+    ~Dsv4AdmTimer() {
+        ws->pft.admit_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ++ws->pft.admit_n;
+    }
+};
 static int32_t dsv4_admit_heat(Dsv4MoeWs* ws, strata::core::ExpertCache* C,
                                strata::core::FileExpertSource& experts, int64_t layer, int32_t e,
                                const std::vector<int32_t>& routed, cudaStream_t stream,
                                int64_t blob_bytes, std::string& err, bool& failed, int dev = 0,
-                               int* why = nullptr) {
+                               int* why = nullptr, bool skip_fill = false) {
+    Dsv4AdmTimer adm_timer(ws);
     failed = false;
     if (why != nullptr) *why = kAdmFree;
     const bool global_scope = !C->per_layer_admission() && ws->call_s >= ws->pf.min_s;
@@ -1755,35 +2095,55 @@ static int32_t dsv4_admit_heat(Dsv4MoeWs* ws, strata::core::ExpertCache* C,
         int64_t vl = layer;
         int32_t victim = -1;
         float vmin = std::numeric_limits<float>::max();
-        for (int64_t e2 = 0; e2 < ws->ne; ++e2) {
-            if (C->slot_of(layer, e2) < 0) continue;
-            if (std::find(routed.begin(), routed.end(), (int32_t) e2) != routed.end()) continue;
-            if (hrow[e2] < vmin) {
-                vmin = hrow[e2];
-                victim = (int32_t) e2;
-            }
-        }
-        if (global_scope && (size_t) ws->n_layers * ws->ne == ws->heat.size()) {
-            int64_t cold_l = -1;
-            float cold = vmin;
+        // [P2] EXACT PRE-TEST.  Every eligible victim is a resident of its layer, so its heat is at
+        // least that layer's cached minimum: `low` below is a lower bound on the victim this scan
+        // would pick.  An eviction needs `hrow[e] > vmin * gain`, which is impossible when
+        // `hrow[e] <= low * gain` - so that test replaces the 256-slot same-layer scan, the 43-layer
+        // scan AND the winning layer's 256-slot rescan on the path most misses take (measured: fail0
+        // 9.9 + fail1 4.1 of 22 misses never find a victim).  Cached minima are 43 array reads.
+        const bool global_heat = global_scope && (size_t) ws->n_layers * ws->ne == ws->heat.size();
+        float low = dsv4_hmin(ws, C, dev, layer);
+        if (global_heat) {
             for (int64_t l2 = 0; l2 < ws->n_layers; ++l2) {
                 if (l2 == layer) continue;
                 const float m = dsv4_hmin(ws, C, dev, l2);
-                if (m < cold) { cold = m; cold_l = l2; }
+                if (m < low) low = m;
             }
-            if (cold_l >= 0) {
-                const float* h2 = ws->heat.data() + (size_t) cold_l * ws->ne;
-                float b2 = std::numeric_limits<float>::max();
-                int32_t e2b = -1;
-                for (int64_t e2 = 0; e2 < ws->ne; ++e2) {
-                    if (C->slot_of(cold_l, e2) < 0) continue;
-                    if (h2[e2] < b2) { b2 = h2[e2]; e2b = (int32_t) e2; }
+        }
+        bool gate_only = false;
+        if (low != std::numeric_limits<float>::max() && !(hrow[e] > low * (float) ws->evict_gain)) {
+            gate_only = true;
+        } else {
+            for (int64_t e2 = 0; e2 < ws->ne; ++e2) {
+                if (C->slot_of(layer, e2) < 0) continue;
+                if (std::find(routed.begin(), routed.end(), (int32_t) e2) != routed.end()) continue;
+                if (hrow[e2] < vmin) {
+                    vmin = hrow[e2];
+                    victim = (int32_t) e2;
                 }
-                if (e2b >= 0) { vmin = b2; vl = cold_l; victim = e2b; }
+            }
+            if (global_heat) {
+                int64_t cold_l = -1;
+                float cold = vmin;
+                for (int64_t l2 = 0; l2 < ws->n_layers; ++l2) {
+                    if (l2 == layer) continue;
+                    const float m = dsv4_hmin(ws, C, dev, l2);
+                    if (m < cold) { cold = m; cold_l = l2; }
+                }
+                if (cold_l >= 0) {
+                    const float* h2 = ws->heat.data() + (size_t) cold_l * ws->ne;
+                    float b2 = std::numeric_limits<float>::max();
+                    int32_t e2b = -1;
+                    for (int64_t e2 = 0; e2 < ws->ne; ++e2) {
+                        if (C->slot_of(cold_l, e2) < 0) continue;
+                        if (h2[e2] < b2) { b2 = h2[e2]; e2b = (int32_t) e2; }
+                    }
+                    if (e2b >= 0) { vmin = b2; vl = cold_l; victim = e2b; }
+                }
             }
         }
         if (victim < 0) {
-            if (why != nullptr) *why = kAdmNoVictim;
+            if (why != nullptr) *why = gate_only ? kAdmGate : kAdmNoVictim;
         } else if (hrow[e] > vmin * (float) ws->evict_gain) {
             if (vl == layer) {
                 slot = C->slot_of(layer, victim);
@@ -1806,6 +2166,9 @@ static int32_t dsv4_admit_heat(Dsv4MoeWs* ws, strata::core::ExpertCache* C,
     // [A1] the newcomer is (or will be, once the fill lands) a resident of `layer`: its heat can be
     // the layer's new minimum, so the cached one must be rebuilt before the next scan trusts it.
     if ((size_t) layer < ws->hmin_dirty[dev].size()) ws->hmin_dirty[dev][(size_t) layer] = 1;
+
+    // [P1] the caller already holds the bytes in the VRAM ring: it queues the D2D itself.
+    if (skip_fill) return slot;
     // [S9c] the pinned, multi-threaded fill: the host pays the read (~0.7 ms) but not the pageable
     // bounce (~2.1 ms); a full ring falls through to the old in-line copy.
     if (ws->cp.on && dsv4_cp_fill(ws, C, experts, layer, e, slot, stream, dev, blob_bytes, err)) {
@@ -1904,11 +2267,13 @@ void dsv4_moe_ws_report(Dsv4MoeWs* ws, const char* tag) {
         std::fprintf(stderr,
                      "dsv4_pftime[%s]: host ms/call over %lld MoE calls: d2h enq %.3f sync %.3f"
                      " (pinned idx %d wgt %d) | bitmap %.3f | pf_layer %.3f (join %.3f peer-sync %.3f)"
-                     " cp_rel %.3f | peer split %.3f | resolve0 %.3f | stage blob %.3f wait %.3f dma %.3f"
+                     " cp_rel %.3f | peer split %.3f | resolve0 %.3f | admit %.3f ms/%lld calls"
+                     " | stage blob %.3f wait %.3f dma %.3f"
                      " | pack %.3f tab-h2d %.3f launch %.3f pintab %.3f | tail sync %.3f\n",
                      tag, (long long) p.calls, p.d2h_enq / n, p.d2h_sync / n, (int) p.pin_idx,
                      (int) p.pin_wgt, p.bitmap / n, p.pf_layer / n, p.pf_join / n, p.pf_peer_sync / n,
                      p.cp_rel / n, (p.peer_loop - p.pf_layer - p.cp_rel) / n, p.resolve0 / n,
+                     p.admit_ms / n, (long long) p.admit_n,
                      p.stage_blob / n, p.stage_wait / n, p.stage_dma / n, p.pack / n, p.tabh2d / n,
                      p.launch / n, p.pintab / n, p.tail_sync / n);
         std::fprintf(stderr,
@@ -1930,6 +2295,30 @@ void dsv4_moe_ws_report(Dsv4MoeWs* ws, const char* tag) {
                      " gate-reject %.2f no-victim %.2f (of %.2f misses)\n",
                      tag, p.why_free / n, p.why_evict / n, p.why_noheat / n, p.why_gate / n,
                      p.why_novictim / n, (double) nmiss / n);
+        // [P1] the VRAM look-ahead ring: how much of the layer's staging it absorbed, and how much of
+        // its own DMA it failed to hide (drain = the host had to wait for the previous batch's fills).
+        if (ws->pv.on) {
+            Dsv4MoeWs::PvWs& pv = ws->pv;
+            int n_free = 0, n_filling = 0, n_queued = 0, n_use = 0;
+            for (int i = 0; i < pv.n; ++i) {
+                const int8_t st = pv.state[(size_t) i];
+                if (st == 0) ++n_free;
+                else if (st == 1) ++n_filling;
+                else if (st == 2) ++n_queued;
+                else ++n_use;
+            }
+            std::fprintf(stderr,
+                         "dsv4_pvring[%s]: per call: hits %.1f (admit %.1f ring-staged %.1f) fallback %.1f"
+                         " | queued %.1f blobs %.1f MiB, drained %.2f MiB"
+                         " | reader %.2f ms/sum, prefetch cost %.3f ms/call (join %.3f drain %.3f)"
+                         " | slots free %d filling %d queued %d in-use %d, read fails %d\n",
+                         tag, (double) pv.hits / n, (double) pv.admits / n, (double) pv.staged / n,
+                         (double) pv.fallback / n, (double) pv.n_read / n,
+                         (double) pv.bytes_moved / n / 1048576.0, (double) pv.pending_bytes / n / 1048576.0,
+                         (double) ((int64_t) pv.read_ms.load()) / n / 1.048576e6,
+                         (pv.fill_ms + pv.join_ms + pv.drain_ms) / n, pv.join_ms / n, pv.drain_ms / n,
+                         n_free, n_filling, n_queued, n_use, (int) pv.fail_read.load());
+        }
         for (int d = 0; d < 2; ++d) {
             strata::core::ExpertCache* C = ws->cache[d];
             if (C == nullptr || p.pl[d].empty()) continue;
@@ -1968,6 +2357,24 @@ void dsv4_moe_ws_report(Dsv4MoeWs* ws, const char* tag) {
 
 void dsv4_moe_ws_free(Dsv4MoeWs* ws) {
     if (ws != nullptr) {
+        // [P1] the ring's readers hold pin slots: join before anything is released
+        dsv4_pv_join(ws);
+        for (int i = 0; i < ws->pv.n; ++i) {
+            if (i < (int) ws->pv.pin.size() && ws->pv.pin[(size_t) i] != nullptr)
+                (void) cudaFreeHost(ws->pv.pin[(size_t) i]);
+            if (i < (int) ws->pv.fill.size() && ws->pv.fill[(size_t) i] != nullptr)
+                (void) cudaEventDestroy(ws->pv.fill[(size_t) i]);
+            if (i < (int) ws->pv.ready.size() && ws->pv.ready[(size_t) i] != nullptr)
+                (void) cudaEventDestroy(ws->pv.ready[(size_t) i]);
+            if (i < (int) ws->pv.freed.size() && ws->pv.freed[(size_t) i] != nullptr)
+                (void) cudaEventDestroy(ws->pv.freed[(size_t) i]);
+        }
+        ws->pv.pin.clear();
+        ws->pv.fill.clear();
+        ws->pv.ready.clear();
+        ws->pv.freed.clear();
+        if (ws->pv.st != nullptr) { (void) cudaStreamDestroy(ws->pv.st); ws->pv.st = nullptr; }
+        if (ws->pv.ring != nullptr) { (void) cudaFree(ws->pv.ring); ws->pv.ring = nullptr; }
         dsv4_pf_join(ws);
         for (uint8_t* p : ws->pf.host) if (p != nullptr) (void) cudaFreeHost(p);
         ws->pf.host.clear();
@@ -2521,10 +2928,32 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
         float* hrow = ws->heat.data() + (size_t) layer * ne;
         for (int64_t j = 0; j < s; ++j)
             for (int64_t k = 0; k < nk; ++k) ++hrow[ws->h_idx[(size_t) (j * nk + k)]];
-        // [A1] the whole table may have moved (the pass decay) and this layer's row just did: the
-        // per-layer minima the cross-layer scan trusts are rebuilt on first use this call.
-        for (int d = 0; d < 2; ++d)
-            std::fill(ws->hmin_dirty[d].begin(), ws->hmin_dirty[d].end(), 1);
+        // [P2] ONLY THE ROWS THAT CHANGED INVALIDATE A CACHED MINIMUM.  The pass decay (layer 0) scales
+        // every row, so it invalidates all of them; otherwise this call incremented `layer`'s row and
+        // nothing else, so the other 42 minima are still exact.  (Measured: marking all 43 dirty on
+        // every call did NOT cost measurable time - 12.60 vs 12.32 ms peer split, inside run noise - so
+        // this is a correctness/cheapness tidy-up, not the fix for the admission cost.)
+        for (int d = 0; d < 2; ++d) {
+            if (layer == 0) {
+                std::fill(ws->hmin_dirty[d].begin(), ws->hmin_dirty[d].end(), 1);
+            } else if ((size_t) layer < ws->hmin_dirty[d].size()) {
+                ws->hmin_dirty[d][(size_t) layer] = 1;
+            }
+        }
+    }
+    // [P1b] mode 2: this layer's routing has just landed above, and the next layer routes from almost
+    // the same hidden state, so queue the next layer's blobs NOW - the readers then have this layer's
+    // whole MoE (~30 ms of GPU work) as runway instead of the ~0 ms dsv4_pf_layer leaves them.
+    if (ws->pv.on && ws->pv.mode == 2 && s >= ws->pf.min_s && layer + 1 < ws->n_layers) {
+        ws->pv.route.clear();
+        std::fill(ws->pv.mark.begin(), ws->pv.mark.end(), 0);
+        for (const int32_t e : ws->h_idx) {
+            if (e >= 0 && e < ws->ne) ws->pv.mark[(size_t) e] = 1;
+        }
+        for (int32_t e = 0; e < ws->ne; ++e) {
+            if (ws->pv.mark[(size_t) e] != 0) ws->pv.route.push_back(e);
+        }
+        dsv4_pv_prefetch(ws, experts, layer, &ws->pv.route);
     }
     if (ws->debug_dir) {
         char path[640];
@@ -2565,7 +2994,16 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             if ((int64_t) ws->h_prev_route.size() < ws->n_layers)
                 ws->h_prev_route.resize((size_t) ws->n_layers);
             std::vector<int64_t>& hist = ws->h_prev_route[(size_t) layer];
-            hist.assign(ws->h_idx.end() - nk, ws->h_idx.end());   // the last row's routing
+            if (ws->pv.on) {
+                // [P1] the ring's read set is the UNION of this pass's routing for the layer, not just the
+                // last row's: one chunk routes 124 distinct experts and the last row sees ~6 of them, so a
+                // last-row prediction would miss almost every blob the next chunk needs.
+                hist.assign(ws->h_idx.begin(), ws->h_idx.end());
+                std::sort(hist.begin(), hist.end());
+                hist.erase(std::unique(hist.begin(), hist.end()), hist.end());
+            } else {
+                hist.assign(ws->h_idx.end() - nk, ws->h_idx.end());   // the last row's routing
+            }
         }
         // ---- the GPU path [S7a]: the layer's unique experts grouped (sorted by id, the reference's
         // accumulation order) and staged a chunk at a time; each chunk is ONE grouped launch per role
@@ -2639,6 +3077,9 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
         // (measured: R=6 decode 151 -> 188 ms/pass with the read set on).  Decode therefore stays
         // byte-for-byte on the pre-S10 path.
         ws->pf.active = false;
+        // [P1] arm the VRAM look-ahead ring once, on the first prefill-sized layer (the cache layout and
+        // thus the free VRAM are final by now; decode keeps the pre-P1 path byte for byte)
+        if (!ws->pv.init_tried && s >= ws->pf.min_s) (void) dsv4_pv_init(ws, blob_bytes);
         const auto pfpl0 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const bool pf_on = s >= ws->pf.min_s && dsv4_pf_layer(ws, experts, layer, groups, peer_on, blob_bytes);
         const auto pfpl1 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -2871,6 +3312,9 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             // here is a device-1-cache-full fallback and goes straight to staging
             strata::core::ExpertCache* C = nullptr;
             if (ws->cache[0] != nullptr && !(peer_on && (e & 1))) C = ws->cache[0];
+            // [P1] did the look-ahead ring bring this expert's blob into VRAM already?
+            int32_t pvi = -1;
+            if (ws->pv.on && (!peer_on || (e & 1) == 0)) pvi = dsv4_pv_lookup(ws, layer, e);
             if (C != nullptr) {
                 const int32_t resident = C->slot_of(layer, e);
                 if (resident >= 0) {
@@ -2884,9 +3328,19 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                     bool failed = false;
                     int why = kAdmFree;
                     const int32_t slot = dsv4_admit_heat(ws, C, experts, layer, e, groups0, stream,
-                                                         (int64_t) blob_bytes, err, failed, 0, &why);
+                                                         (int64_t) blob_bytes, err, failed, 0, &why,
+                                                         pvi >= 0);
                     if (failed) return false;
                     if (slot >= 0) dst = C->device_slot(slot);
+                    if (slot >= 0 && pvi >= 0) {
+                        // [P1] the bytes are already in the ring: D2D on the ring's own stream
+                        if (!dsv4_pv_to_slot(ws, pvi, dst, (size_t) blob_bytes, stream)) {
+                            err = "dsv4: P1 ring -> cache D2D failed";
+                            return false;
+                        }
+                        ++ws->pv.admits;
+                        ++ws->pv.hits;
+                    }
                     ++ws->cache_misses;
                     if (pft_on) {
                         Dsv4MoeWs::PfTime::PlStat& st = ws->pft.pl[0][(size_t) layer];
@@ -2910,6 +3364,16 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                             default: break;
                         }
                     }
+                }
+            }
+            if (dst == nullptr && pvi >= 0) {
+                // [P1] no cache room: the kernels read the ring slot itself — no copy at all
+                dst = dsv4_pv_take(ws, pvi, stream);
+                if (dst != nullptr) {
+                    ++ws->pv.staged;
+                    ++ws->pv.hits;
+                } else {
+                    ++ws->pv.fallback;
                 }
             }
             if (dst == nullptr) ++n_staged;
@@ -3196,6 +3660,9 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             ws->tm_group += std::chrono::duration<double, std::milli>(tp3 - tp2).count();
             ws->tm_chunks += std::chrono::duration<double, std::milli>(tp4 - tp3).count();
         }
+        // [P1] every kernel that reads a ring slot is queued: the ring's slots for this layer may be
+        // recycled once the compute stream passes this event.
+        dsv4_pv_layer_done(ws, stream);
         // [S11] the CPU arm.  Every launch for the GPU groups is already queued, so the GPU is busy
         // while these host threads run; the arm's own device work (swiglu, then the scatter into comb6)
         // goes on `stream` and lands before the combine below.  Nothing about the GPU path changes.
