@@ -37,6 +37,7 @@
 #include <string.h>
 #include <math.h>
 #include <cmath>
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <memory>
@@ -573,6 +574,63 @@ inline bool dsv4_cpu_gemv(const CpuGemvJob& job, int nthr, float* scratch, CpuPo
     }
     pool->run(&sink);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// [S11] Batch sink: one pool barrier for a whole ROLE, i.e. for every expert the CPU arm owns in
+// this layer.  A layer's CPU slice is ~32 experts x 3 roles; a barrier per expert (67 us at 18
+// threads) would cost ~6 ms/layer, which is the same order as the work it schedules.  The jobs'
+// row spaces are concatenated and thread `tid` owns one contiguous slice of the concatenation, so
+// the split is still static (no work stealing, no atomics) and each thread's slice covers at most
+// two jobs.  Every job's arithmetic is unchanged: the same row range of the same job.
+struct CpuGemvBatchSink : CpuSink {
+    const CpuGemvJob* jobs = nullptr;
+    int njobs = 0;
+    int nthr = 1;
+    int total = 0;      // sum of jobs[].rows
+    int stride = 0;     // scratch floats per thread (>= every job's cols)
+    float* xT = nullptr;
+    void run(int tid) override {
+        const int64_t lo = (int64_t) total * tid / nthr;
+        const int64_t hi = (int64_t) total * (tid + 1) / nthr;
+        if (hi <= lo) return;
+        float* sc = xT + (int64_t) tid * stride;
+        int base = 0;
+        for (int j = 0; j < njobs; ++j) {
+            const int r = jobs[j].rows;
+            const int a = (int) (std::max<int64_t>(lo, base) - base);
+            const int b = (int) (std::min<int64_t>(hi, base + r) - base);
+            if (b > a) dsv4_cpu_gemv_rows(jobs[j], a, b, sc);
+            base += r;
+            if (base >= hi) break;
+        }
+    }
+};
+
+// Multi-threaded GEMV over a batch of jobs (one barrier).  `scratch` holds nthr*stride floats,
+// 64 B aligned, stride >= max(jobs[].cols).  Returns the number of rows scheduled.
+inline int64_t dsv4_cpu_gemv_batch(const CpuGemvJob* jobs, int njobs, int nthr, int stride, float* scratch,
+                                   CpuPool* pool) {
+    if (jobs == nullptr || njobs <= 0 || nthr < 1 || scratch == nullptr) return 0;
+    int64_t total = 0;
+    for (int j = 0; j < njobs; ++j) {
+        if (jobs[j].rows > 0 && jobs[j].cols > 0 && jobs[j].nent > 0) total += jobs[j].rows;
+    }
+    if (total == 0) return 0;
+    if ((int64_t) nthr > total) nthr = (int) total;
+    CpuGemvBatchSink sink;
+    sink.jobs = jobs;
+    sink.njobs = njobs;
+    sink.nthr = nthr;
+    sink.total = (int) total;
+    sink.stride = stride;
+    sink.xT = scratch;
+    if (nthr == 1 || pool == nullptr) {
+        for (int t = 0; t < nthr; ++t) sink.run(t);
+    } else {
+        pool->run(&sink);
+    }
+    return total;
 }
 
 }  // namespace dsv4

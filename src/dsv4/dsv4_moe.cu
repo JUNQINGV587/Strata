@@ -18,6 +18,9 @@
 // dot_fp32 + expert_apply exactly and doubles as the GPU kernels' numerical cross-check.
 
 #include "dsv4_moe.h"
+// [S11] the Stage-0 host GEMV (bit-exact with the GPU kernels; verified 200/200 in
+// REPORT-PREFILL-CPU-S0.md) — the CPU arm reuses it as-is, no second implementation.
+#include "dsv4_moe_cpu.h"
 
 #include "dsv4_moe_time.h"
 
@@ -704,6 +707,28 @@ void dequant_q8_0_host(const uint8_t* src, int64_t n, float* dst) {
 struct Dsv4MoeWs {
     int64_t s = 0, n = 0, ne = 0, nk = 0, inter = 0;
     bool cpu_pool = false;
+    // ---- [S11] the CPU expert arm: STRATA_DSV4_MOE_CPU=<n> gives experts [0,n) to the host pool,
+    // the GPU computes the rest in the same layer call.  The arm runs on its own stream and its
+    // results land in the SAME comb6 cells the GPU path would have written, so the existing combine
+    // kernel and every arithmetic order stay untouched.  cpu_experts == 0 keeps the old path
+    // instruction for instruction (no extra copy, no extra launch, no extra stream).
+    int cpu_experts = 0;                 ///< [S11] experts [0,cpu_experts) run on the host
+    int cpu_threads = 0;                 ///< [S11] pool size (STRATA_DSV4_MOE_CPU_THREADS, dflt 18)
+    void* cpu_pool_arm = nullptr;        ///< [S11] CpuPool*, the persistent host pool of the arm
+    float* cpu_scratch = nullptr;        ///< [S11] nthr * inter floats, 64 B aligned, one row scratch each
+    float *h_cg = nullptr, *h_cu = nullptr, *h_act = nullptr, *h_cout = nullptr;  ///< [S11] pinned host
+    float* h_cpw = nullptr;              ///< [S11] pinned per-entry routing weights
+    float *d_cg = nullptr, *d_cu = nullptr, *d_act = nullptr;   ///< [S11] device side of the arm
+    float* d_cpw = nullptr;              ///< [S11] device per-entry weights
+    cudaStream_t cpu_stream = nullptr;   ///< [S11] the arm's H2D / swiglu / D2H stream
+    cudaEvent_t cpu_ev = nullptr;        ///< [S11] "the arm's swiglu reached h_act"
+    std::vector<int32_t> h_cpu_groups;                          ///< [S11] this layer's CPU expert ids
+    std::vector<int32_t> h_cpu_ebase, h_cpu_tok, h_cpu_slot;   ///< [S11] per-expert entry tables
+    std::vector<float> h_cpu_pw;         ///< [S11] per-entry routing weights (host)
+    std::vector<const uint8_t*> cpu_blobs;   ///< [S11] one stable mapping pointer per CPU expert
+    std::vector<CpuGemvJob> cpu_jobs;    ///< [S11] the batch handed to the pool
+    int64_t cpu_entries = 0, cpu_groups = 0;   ///< [S11] counters (summed over calls)
+    double tm_cpu_arm = 0, tm_cpu_p1 = 0, tm_cpu_sw = 0, tm_cpu_p2 = 0, tm_cpu_h2d = 0;  ///< [S11]
     uint64_t blob_bytes = 0;
     const char* debug_dir = nullptr;
     // per-token
@@ -992,7 +1017,33 @@ Dsv4MoeWs* dsv4_moe_ws_new(const Dsv4Geometry& g, int64_t s, std::string& err) {
         delete ws;
         return nullptr;
     }
-    ws->cpu_pool = std::getenv("STRATA_DSV4_MOE_CPU") != nullptr;
+    // [S11] STRATA_DSV4_MOE_CPU: "all" keeps the pre-S11 all-CPU reference path; a number n gives
+    // experts [0,n) to the host pool and leaves the rest to the GPU (the parallel arm).  Unset or 0
+    // is the release path, unchanged.
+    ws->cpu_pool = false;
+    ws->cpu_experts = 0;
+    if (const char* cenv = std::getenv("STRATA_DSV4_MOE_CPU")) {
+        if (std::strcmp(cenv, "all") == 0) {
+            ws->cpu_pool = true;
+        } else if (*cenv != '\0') {
+            int ncpu = std::atoi(cenv);
+            if (ncpu < 0) ncpu = 0;
+            if (ncpu > 0) {
+                if ((int64_t) ncpu > ws->ne) ncpu = (int) ws->ne;
+                ws->cpu_experts = ncpu;
+            }
+        }
+    }
+    if (ws->cpu_experts > 0 && !strata::dsv4::dsv4_cpu_gemv_supported()) {
+        std::fprintf(stderr, "dsv4_moe: STRATA_DSV4_MOE_CPU=%d but this CPU lacks AVX-512 "
+                             "F/DQ/BW/VL+FMA; the CPU arm stays off\n", ws->cpu_experts);
+        ws->cpu_experts = 0;
+    }
+    ws->cpu_threads = 18;
+    if (const char* tenv = std::getenv("STRATA_DSV4_MOE_CPU_THREADS")) {
+        int t = std::atoi(tenv);
+        if (t >= 1 && t <= 64) ws->cpu_threads = t;
+    }
     ws->debug_dir = std::getenv("STRATA_DSV4_MOE_DEBUG");
     if (const char* renv = std::getenv("STRATA_DSV4_ROUTE_DUMP")) {
         ws->route_dump = std::fopen(renv, "wb");
@@ -1183,6 +1234,56 @@ Dsv4MoeWs* dsv4_moe_ws_new(const Dsv4Geometry& g, int64_t s, std::string& err) {
     ws->h_cnt.resize((size_t) ws->ne);
     ws->h_cur.resize((size_t) ws->ne);
     ws->h_in0.resize((size_t) ws->ne);
+    // [S11] the CPU arm's buffers, all pinned and all sized for a whole layer's entry list (m), so
+    // the arm never allocates and never stalls on a pageable copy.  Any failure turns the arm off
+    // (the layer then computes every expert on the GPU, exactly as before).
+    if (ws->cpu_experts > 0) {
+        const size_t cap = (size_t) m;
+        bool ok = true;
+        struct PinAlloc { void** p; size_t bytes; };
+        const PinAlloc pins[] = {
+            {(void**) &ws->h_cg, cap * (size_t) inter * 4}, {(void**) &ws->h_cu, cap * (size_t) inter * 4},
+            {(void**) &ws->h_act, cap * (size_t) inter * 4}, {(void**) &ws->h_cout, cap * (size_t) n * 4},
+            {(void**) &ws->h_cpw, cap * 4},
+        };
+        for (const PinAlloc& a : pins)
+            ok = ok && cudaHostAlloc(a.p, a.bytes, cudaHostAllocPortable) == cudaSuccess;
+        const size_t dev[] = {(size_t) cap * (size_t) inter * 4, (size_t) cap * (size_t) inter * 4,
+                              (size_t) cap * (size_t) inter * 4, (size_t) cap * 4};
+        void** dst[] = {(void**) &ws->d_cg, (void**) &ws->d_cu, (void**) &ws->d_act, (void**) &ws->d_cpw};
+        for (int i = 0; ok && i < 4; ++i) ok = cudaMalloc(dst[i], dev[i]) == cudaSuccess;
+        ok = ok && cudaStreamCreateWithFlags(&ws->cpu_stream, cudaStreamNonBlocking) == cudaSuccess;
+        ok = ok && cudaEventCreateWithFlags(&ws->cpu_ev, cudaEventDisableTiming) == cudaSuccess;
+        const int64_t scols = ws->n > ws->inter ? ws->n : ws->inter;
+        const size_t scr = ((size_t) ws->cpu_threads * (size_t) scols * 4 + 63) & ~(size_t) 63;
+        if (ok) {
+            ws->cpu_scratch = (float*) std::aligned_alloc(64, scr);
+            ok = ws->cpu_scratch != nullptr;
+        }
+        if (ok) {
+            ws->cpu_pool_arm = new strata::dsv4::CpuPool(ws->cpu_threads, /*pin=*/true, /*pin_base=*/1);
+            ws->h_cpu_ebase.reserve((size_t) ws->ne + 1);
+            ws->h_cpu_tok.reserve(cap);
+            ws->h_cpu_pw.reserve(cap);
+            ws->h_cpu_slot.reserve(cap);
+            ws->cpu_jobs.reserve((size_t) 2 * ws->ne);
+            ws->cpu_blobs.reserve((size_t) ws->ne);
+        }
+        if (!ok) {
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "dsv4_moe: the CPU arm's buffers are unavailable; every expert "
+                                 "stays on the GPU\n");
+            if (ws->cpu_scratch != nullptr) std::free(ws->cpu_scratch);
+            ws->cpu_scratch = nullptr;
+            void* hp[] = {ws->h_cg, ws->h_cu, ws->h_act, ws->h_cout, ws->h_cpw};
+            for (void* p : hp) if (p != nullptr) (void) cudaFreeHost(p);
+            ws->h_cg = ws->h_cu = ws->h_act = ws->h_cout = ws->h_cpw = nullptr;
+            void* dp[] = {ws->d_cg, ws->d_cu, ws->d_act, ws->d_cpw};
+            for (void* p : dp) if (p != nullptr) (void) cudaFree(p);
+            ws->d_cg = ws->d_cu = ws->d_act = ws->d_cpw = nullptr;
+            ws->cpu_experts = 0;
+        }
+    }
     return ws;
 }
 
@@ -1709,6 +1810,18 @@ void dsv4_moe_ws_report(Dsv4MoeWs* ws, const char* tag) {
                  tag, (long long) ws->moe_calls, ws->tm_pre / calls, ws->tm_sync / calls,
                  ws->tm_group / calls, ws->tm_chunks / calls, ws->tm_tail / calls,
                  (ws->tm_pre + ws->tm_sync + ws->tm_group + ws->tm_chunks + ws->tm_tail) / calls);
+    // [S11] the CPU arm's own split: its host time is inside "chunks" above (the arm runs between the
+    // GPU launches and the peer collect), so the numbers here say whether the arm is bandwidth, compute
+    // or the swiglu round trip.
+    if (ws->cpu_experts > 0 && ws->moe_calls > 0)
+        std::fprintf(stderr,
+                     "dsv4_moe[%s]: cpu arm ms/call: gate+up %.3f swiglu %.3f down %.3f commit %.3f "
+                     "(total %.3f) | %.1f groups, %.1f entries/call, %d threads, %.3f us/entry\n",
+                     tag, ws->tm_cpu_p1 / calls, ws->tm_cpu_sw / calls, ws->tm_cpu_p2 / calls,
+                     ws->tm_cpu_h2d / calls, ws->tm_cpu_arm / calls,
+                     (double) ws->cpu_groups / (double) ws->moe_calls,
+                     (double) ws->cpu_entries / (double) ws->moe_calls, ws->cpu_threads,
+                     ws->cpu_entries > 0 ? 1000.0 * ws->tm_cpu_arm / (double) ws->cpu_entries : 0.0);
     if (ws->pf.n_layer > 0)
         std::fprintf(stderr, "dsv4_moe[%s]: prefetch: %lld layers engaged, %lld blobs read into pinned\n", tag,
                      (long long) ws->pf.n_layer, (long long) ws->pf.n_jobs);
@@ -1827,6 +1940,23 @@ void dsv4_moe_ws_free(Dsv4MoeWs* ws) {
         if (ev != nullptr) cudaEventDestroy(ev);
     if (ws->sh_stream != nullptr) cudaStreamDestroy(ws->sh_stream);
     dsv4_moe_ws_report(ws, "last");
+    // [S11] the CPU arm: the pool first (its threads touch nothing else), then the buffers
+    if (ws->cpu_pool_arm != nullptr) {
+        delete (strata::dsv4::CpuPool*) ws->cpu_pool_arm;
+        ws->cpu_pool_arm = nullptr;
+    }
+    if (ws->cpu_scratch != nullptr) {
+        std::free(ws->cpu_scratch);
+        ws->cpu_scratch = nullptr;
+    }
+    if (ws->cpu_ev != nullptr) cudaEventDestroy(ws->cpu_ev);
+    if (ws->cpu_stream != nullptr) cudaStreamDestroy(ws->cpu_stream);
+    for (void* p : {ws->h_cg, ws->h_cu, ws->h_act, ws->h_cout, ws->h_cpw})
+        if (p != nullptr) (void) cudaFreeHost(p);
+    for (void* p : {ws->d_cg, ws->d_cu, ws->d_act, ws->d_cpw})
+        if (p != nullptr) (void) cudaFree(p);
+    ws->h_cg = ws->h_cu = ws->h_act = ws->h_cout = ws->h_cpw = nullptr;
+    ws->d_cg = ws->d_cu = ws->d_act = ws->d_cpw = nullptr;
     for (cudaEvent_t& ev : ws->tev)
         if (ev != nullptr) cudaEventDestroy(ev);
     cudaFree(ws->y);
@@ -2011,6 +2141,184 @@ void moe_debug_dump_raw(const Dsv4MoeWs* ws, int64_t layer, const char* tag, con
     }
 }
 
+// ---------------------------------------------------------------------------
+// [S11] the CPU expert arm.  Experts [0,cpu_experts) of THIS layer run on the host pool while the
+// GPU stream works on the rest; the two are joined by the existing combine kernel, which is why
+// the arm ends by scattering into comb6 and nothing else changes.
+//
+// Bit-exactness, per link in the chain:
+//   * weights: the same blob bytes (experts.blob == the mapping the GPU copy reads), the same role
+//     offsets and the same s2 tail scale index per role (gate 0, up 1, down 2) as the launches.
+//   * gate/up: the Stage-0 kernel (verified 200/200 against both GPU GEMV kernels, FMA form).
+//   * swiglu: the GPU's own dsv4_swiglu_clamp_kernel on the arm's stream (the host libm expf is not
+//     bit-equal to nvcc's, so the activation may not be recomputed on the host).  It is a copy of the
+//     gate/up outputs up, one kernel, one copy back - not an approximation.
+//   * down: the same Stage-0 kernel, natural x = the activation rows, the reference xidx layout.
+//   * accumulation: each entry's down output is written into ITS comb6 cell by the same
+//     dsv4_scatter_rows_kernel the GPU path uses, before dsv4_moe_combine_kernel runs in ascending
+//     expert id.  No order changes, no atomics, no new accumulator.
+//   * x: ws->y (the row the GPU would have read through ws->yt), copied D2H once per layer - the copy
+//     is enqueued before the pre-existing route sync, so it costs nothing extra.
+bool dsv4_moe_cpu_arm(Dsv4MoeWs* ws, strata::core::FileExpertSource& experts, int64_t layer,
+                      const strata::kernels::cpu::NativeFmt& fmt, int64_t s,
+                      const std::vector<int32_t>& cg, cudaStream_t stream, std::string& err) {
+    const int64_t n = ws->n, inter = ws->inter, nk = ws->nk;
+    const int ncpu = (int) cg.size();
+    if (ncpu <= 0) return true;
+    const auto tA0 = std::chrono::steady_clock::now();
+    const bool ton = ws->time_on;
+
+    // ---- the arm's entry tables: per CPU expert, its entries in (token, slot) order.  Same bucket
+    // fill as the GPU tables (ascending expert id, then the token/slot order of h_idx).
+    std::vector<int32_t>& ebase = ws->h_cpu_ebase;
+    std::vector<int32_t>& ctok = ws->h_cpu_tok;
+    std::vector<float>& cpw = ws->h_cpu_pw;
+    std::vector<int32_t>& cslot = ws->h_cpu_slot;
+    ebase.clear();
+    ctok.clear();
+    cpw.clear();
+    cslot.clear();
+    ebase.push_back(0);
+    for (const int32_t e : cg) ebase.push_back(ebase.back() + ws->h_cnt[(size_t) e]);
+    const int64_t entries = ebase.back();
+    if (entries == 0) return true;
+    ctok.resize((size_t) entries);
+    cpw.resize((size_t) entries);
+    cslot.resize((size_t) entries);
+    {
+        std::vector<int32_t>& cur = ws->h_cur;
+        std::fill(cur.begin(), cur.end(), -1);
+        for (int g = 0; g < ncpu; ++g) cur[(size_t) cg[(size_t) g]] = ebase[(size_t) g];
+        for (int64_t j = 0; j < s; ++j)
+            for (int64_t k = 0; k < nk; ++k) {
+                const int64_t i = j * nk + k;
+                const int32_t e = ws->h_idx[(size_t) i];
+                const int32_t pos = cur[(size_t) e];
+                if (pos < 0) continue;
+                cur[(size_t) e] = pos + 1;
+                ctok[(size_t) pos] = (int32_t) j;
+                cpw[(size_t) pos] = ws->h_wgt[(size_t) i];
+                cslot[(size_t) pos] = dsv4_comb_cell(ws->h_idx.data(), j, (int) nk, e, k);
+            }
+    }
+    // ---- the blobs.  Resolved here, after every GPU-side resolve has finished, and used only inside
+    // this layer: with the dsv4 engine's open path (mapped, no set_gguf / direct / io_pf picks) these are
+    // the file mapping's own addresses, and even a recycling staging tier holds a blob for the layer it
+    // was asked for, so no pointer below can be recycled under the arm.
+    std::vector<const uint8_t*>& blobs = ws->cpu_blobs;
+    blobs.resize((size_t) ncpu);
+    for (int g = 0; g < ncpu; ++g) {
+        blobs[(size_t) g] = experts.blob(layer, (int64_t) cg[(size_t) g]);
+        if (blobs[(size_t) g] == nullptr) {
+            err = "dsv4_moe: no blob for a CPU-arm expert";
+            return false;
+        }
+    }
+    strata::dsv4::CpuPool* pool = (strata::dsv4::CpuPool*) ws->cpu_pool_arm;
+    float* scratch = ws->cpu_scratch;
+    const int nthr = ws->cpu_threads;
+    const int stride = (int) (n > inter ? n : inter);   // >= every job's cols (gate/up n, down inter)
+
+    // ---- phase 1: gate and up.  One pool barrier covers both roles for every CPU expert.
+    const auto tP0 = std::chrono::steady_clock::now();
+    std::vector<CpuGemvJob>& jobs = ws->cpu_jobs;
+    jobs.clear();
+    for (int g = 0; g < ncpu; ++g) {
+        const int nent = (int) (ebase[(size_t) g + 1] - ebase[(size_t) g]);
+        if (nent <= 0) continue;
+        CpuGemvJob j{};
+        j.blob = blobs[(size_t) g];
+        j.tail_off = (int64_t) fmt.tail_off;
+        j.x = ws->h_x.data();
+        j.xstride = n;
+        j.xidx = ctok.data() + ebase[(size_t) g];
+        j.nent = nent;
+        j.cols = (int) n;
+        j.rows = (int) inter;
+        j.ystride = inter;
+        j.variant = strata::dsv4::kCpuVariantFma;
+        j.tile = 0;
+        j.role_off = 0;
+        j.s2i = 0;
+        j.y = ws->h_cg + (int64_t) ebase[(size_t) g] * inter;
+        jobs.push_back(j);
+        j.role_off = (int64_t) fmt.up_off;
+        j.s2i = 1;
+        j.y = ws->h_cu + (int64_t) ebase[(size_t) g] * inter;
+        jobs.push_back(j);
+    }
+    if (jobs.empty()) return true;
+    const int64_t rows1 = strata::dsv4::dsv4_cpu_gemv_batch(jobs.data(), (int) jobs.size(), nthr, stride,
+                                                            scratch, pool);
+    if (rows1 <= 0) {
+        err = "dsv4_moe: the CPU arm scheduled no gate/up rows";
+        return false;
+    }
+    // ---- swiglu on the device (identical kernel, identical order), then the activation comes back
+    const auto tS0 = std::chrono::steady_clock::now();
+    CKM(cudaMemcpyAsync(ws->d_cg, ws->h_cg, (size_t) (entries * inter) * 4, cudaMemcpyHostToDevice,
+                        ws->cpu_stream));
+    CKM(cudaMemcpyAsync(ws->d_cu, ws->h_cu, (size_t) (entries * inter) * 4, cudaMemcpyHostToDevice,
+                        ws->cpu_stream));
+    CKM(cudaMemcpyAsync(ws->d_cpw, cpw.data(), (size_t) entries * 4, cudaMemcpyHostToDevice,
+                        ws->cpu_stream));
+    dsv4_swiglu_clamp_kernel<<<(unsigned) entries, 256, 0, ws->cpu_stream>>>(ws->d_cg, ws->d_cu, ws->d_cpw,
+                                                                            (int) inter, ws->d_act, 0);
+    CKM(cudaGetLastError());
+    CKM(cudaMemcpyAsync(ws->h_act, ws->d_act, (size_t) (entries * inter) * 4, cudaMemcpyDeviceToHost,
+                        ws->cpu_stream));
+    CKM(cudaEventRecord(ws->cpu_ev, ws->cpu_stream));
+    CKM(cudaEventSynchronize(ws->cpu_ev));
+    const auto tP2 = std::chrono::steady_clock::now();
+
+    // ---- phase 2: down.  Natural x (the activation rows), xidx null - the reference's down layout.
+    jobs.clear();
+    for (int g = 0; g < ncpu; ++g) {
+        const int nent = (int) (ebase[(size_t) g + 1] - ebase[(size_t) g]);
+        if (nent <= 0) continue;
+        CpuGemvJob j{};
+        j.blob = blobs[(size_t) g];
+        j.role_off = (int64_t) fmt.down_off;
+        j.tail_off = (int64_t) fmt.tail_off;
+        j.s2i = 2;
+        j.x = ws->h_act + (int64_t) ebase[(size_t) g] * inter;
+        j.xstride = inter;
+        j.xidx = nullptr;
+        j.nent = nent;
+        j.cols = (int) inter;
+        j.rows = (int) n;
+        j.y = ws->h_cout + (int64_t) ebase[(size_t) g] * n;
+        j.ystride = n;
+        j.variant = strata::dsv4::kCpuVariantFma;
+        j.tile = 0;
+        jobs.push_back(j);
+    }
+    const int64_t rows2 = strata::dsv4::dsv4_cpu_gemv_batch(jobs.data(), (int) jobs.size(), nthr, stride,
+                                                            scratch, pool);
+    if (rows2 <= 0) {
+        err = "dsv4_moe: the CPU arm scheduled no down rows";
+        return false;
+    }
+    // ---- the contributions land in comb6 exactly where the GPU would have put them, then the
+    // existing combine kernel adds them in ascending expert id.
+    const auto tH0 = std::chrono::steady_clock::now();
+    CKM(cudaMemcpyAsync(ws->pout, ws->h_cout, (size_t) (entries * n) * 4, cudaMemcpyHostToDevice, stream));
+    CKM(cudaMemcpyAsync(ws->d_slot, cslot.data(), (size_t) entries * 4, cudaMemcpyHostToDevice, stream));
+    dsv4_scatter_rows_kernel<<<(unsigned) entries, 256, 0, stream>>>(ws->pout, ws->d_slot, ws->comb6, n);
+    CKM(cudaGetLastError());
+    if (ton) {
+        const auto tA1 = std::chrono::steady_clock::now();
+        ws->tm_cpu_p1 += std::chrono::duration<double, std::milli>(tS0 - tP0).count();
+        ws->tm_cpu_sw += std::chrono::duration<double, std::milli>(tP2 - tS0).count();
+        ws->tm_cpu_p2 += std::chrono::duration<double, std::milli>(tH0 - tP2).count();
+        ws->tm_cpu_h2d += std::chrono::duration<double, std::milli>(tA1 - tH0).count();
+        ws->tm_cpu_arm += std::chrono::duration<double, std::milli>(tA1 - tA0).count();
+        ws->cpu_entries += entries;
+        ws->cpu_groups += ncpu;
+    }
+    return true;
+}
+
 bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                    strata::core::FileExpertSource& experts, float* d_h, const int32_t* d_tokens,
                    int64_t s, Dsv4MoeWs* ws, cudaStream_t stream, std::string& err) {
@@ -2106,6 +2414,11 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
                         stream));
     CKM(cudaMemcpyAsync(ws->h_wgt.data(), ws->wgt, (size_t) (s * nk) * 4, cudaMemcpyDeviceToHost,
                         stream));
+    // [S11] the CPU arm's input rows.  Enqueued here, before the route sync this call already pays, so
+    // the layer's y (the exact rows the GPU reads through yt) costs no extra wait; n=0 never enqueues it
+    // and the default path is byte-for-byte unchanged.
+    if (ws->cpu_experts > 0)
+        CKM(cudaMemcpyAsync(ws->h_x.data(), ws->y, (size_t) (s * n) * 4, cudaMemcpyDeviceToHost, stream));
     const auto pfdh1 = pft_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CKM(cudaStreamSynchronize(stream));
     const auto tp2 = std::chrono::steady_clock::now();
@@ -2202,6 +2515,19 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
         }
         for (int64_t e = 0; e < ws->ne; ++e)
             if (mask[(size_t) (e >> 6)] & (1ull << (e & 63))) groups.push_back((int32_t) e);
+        // [S11] the CPU arm's experts leave the GPU list here, BEFORE every consumer of it (prefetch,
+        // peer split, admission, chunking, the launches), so the GPU path never stages, never admits and
+        // never computes them.  The remaining ids keep their order: the ids below the split are a prefix
+        // of the ascending list, so this is a filter, not a reordering.
+        ws->h_cpu_groups.clear();
+        if (ws->cpu_experts > 0) {
+            size_t w = 0;
+            for (size_t i = 0; i < groups.size(); ++i) {
+                if (groups[i] < ws->cpu_experts) ws->h_cpu_groups.push_back(groups[i]);
+                else groups[w++] = groups[i];
+            }
+            groups.resize(w);
+        }
         const auto g1t = ton ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (ton) ws->tm_g1 += std::chrono::duration<double, std::milli>(g1t - tp2).count();
         if (pft_on) {
@@ -2776,6 +3102,16 @@ bool dsv4_moe_half(const Dsv4Geometry& g, int64_t layer, const Dsv4MoeLayer& w,
             tp4 = std::chrono::steady_clock::now();
             ws->tm_group += std::chrono::duration<double, std::milli>(tp3 - tp2).count();
             ws->tm_chunks += std::chrono::duration<double, std::milli>(tp4 - tp3).count();
+        }
+        // [S11] the CPU arm.  Every launch for the GPU groups is already queued, so the GPU is busy
+        // while these host threads run; the arm's own device work (swiglu, then the scatter into comb6)
+        // goes on `stream` and lands before the combine below.  Nothing about the GPU path changes.
+        if (ws->cpu_experts > 0 && !ws->h_cpu_groups.empty()) {
+            std::string cerr;
+            if (!dsv4_moe_cpu_arm(ws, experts, layer, fmt, s, ws->h_cpu_groups, stream, cerr)) {
+                err = cerr;
+                return false;
+            }
         }
         if (entries1 > 0) {
             // the peer's outputs cross back as ONE small DMA, then combine on device 0 (bout is
